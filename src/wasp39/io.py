@@ -38,3 +38,13 @@ def save_transmission_spectrum_txt(
     header = "wl_center_um depth depth_err_lo depth_err_hi"
     arr = np.column_stack([wl_centers_um, depth, depth_err_lo, depth_err_hi])
     np.savetxt(out_txt, arr, header=header)
+
+def load_transmission_spectrum_txt(path):
+    """
+    Load transmission spectrum saved by save_transmission_spectrum_txt.
+    Returns wl, depth, elo, ehi
+    """
+    data = np.loadtxt(path)
+    wl, depth, elo, ehi = data.T
+    return wl, depth, elo, ehi
+

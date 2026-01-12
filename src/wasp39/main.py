@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import os
+import argparse
 import numpy as np
+import matplotlib.pyplot as plt
 
-from .io import load_prepared_lightcurve, save_transmission_spectrum_txt
+from .io import (
+    load_prepared_lightcurve,
+    load_transmission_spectrum_txt,
+    save_transmission_spectrum_txt,   # keep if you have it; remove if not in your repo
+)
 from .normalize import normalize_white_light
 from .binning import bin_time_series
 from .lightcurve import TransitConfig, batman_model
@@ -16,9 +22,21 @@ from .plotting import (
     save_transmission_spectrum_plot,
 )
 from .spectrum import construct_transmission_spectrum
-
+from .platon_model import (
+    wasp39b_defaults_si,
+    PlatonAtmosphereParams,
+    platon_transit_depths_at_wavelengths,
+    make_atm_params
+)
 
 def main():
+    parser = argparse.ArgumentParser(description="WASP-39b transmission spectroscopy pipeline")
+    parser.add_argument(
+        "--skip-spectrum-mcmc",
+        action="store_true",
+        help="Skip per-bin transmission spectrum MCMC and load existing output file instead",
+    )
+    args = parser.parse_args()
     # ======================================================
     # STEP 0 — Paths + load the prepared light curve file
     # ======================================================
@@ -131,31 +149,72 @@ def main():
     rp_init = float(rp_m)
 
     # ======================================================
-    # STEP 5 — Transmission spectrum construction (bin-by-bin Rp/R*)
+    # STEP 5 — Transmission spectrum construction
     # ======================================================
-    print("STEP 5 — Build transmission spectrum (wavelength bins + MCMC per bin)")
-    wl_c, depth, elo, ehi = construct_transmission_spectrum(
-        bjd=bjd,
-        wavelength_um=wavelength,
-        flux_2d=flux,
-        fluxerr_2d=flux_err,
-        cfg=cfg,
-        n_wavelength_bins=30,
-        oot_index=oot_idx,
-        rp_init=rp_init,
-        progress=True,
-        verbose=True,
-        time_bin_factor=10,  # optional; set None if you want full-res
-    )
-
     out_txt = os.path.join(out_dir, "transmission_spectrum.txt")
     out_png = os.path.join(out_dir, "transmission_spectrum.png")
-    save_transmission_spectrum_txt(out_txt, wl_c, depth, elo, ehi)
-    save_transmission_spectrum_plot(out_png, wl_c, depth, elo, ehi, "WASP-39b Transmission Spectrum")
 
-    print("Saved:", out_txt)
-    print("Saved:", out_png)
-    print("\nPipeline complete.")
+    if args.skip_spectrum_mcmc and os.path.exists(out_txt):
+        print("STEP 5 — Skipping transmission spectrum MCMC (loading existing result)")
+        wl_c, depth, elo, ehi = load_transmission_spectrum_txt(out_txt)
+
+    else:
+        print("STEP 5 — Build transmission spectrum (wavelength bins + MCMC per bin)")
+        wl_c, depth, elo, ehi = construct_transmission_spectrum(
+            bjd=bjd,
+            wavelength_um=wavelength,
+            flux_2d=flux,
+            fluxerr_2d=flux_err,
+            cfg=cfg,
+            n_wavelength_bins=30,
+            oot_index=oot_idx,
+            rp_init=rp_init,
+            progress=True,
+            verbose=True,
+            time_bin_factor=10,
+        )
+
+        save_transmission_spectrum_txt(out_txt, wl_c, depth, elo, ehi)
+        save_transmission_spectrum_plot(
+            out_png,
+            wl_c, depth, elo, ehi,
+            "WASP-39b Transmission Spectrum",
+        )
+
+        print("Saved:", out_txt)
+        print("Saved:", out_png)
+
+    # ======================================================
+    # STEP 6 — PLATON forward models (overlay on observed spectrum)
+    # ======================================================
+    print("STEP 6 — PLATON forward models (overlay on observed spectrum)")
+
+    planet = wasp39b_defaults_si()
+
+    models = [
+        ("solar (logZ=0, C/O=0.53)", make_atm_params(logZ=0.0, CO_ratio=0.53)),
+        ("metal-rich (logZ=1)", make_atm_params(logZ=1.0, CO_ratio=0.53)),
+        ("high C/O (C/O=1.0)", make_atm_params(logZ=0.0, CO_ratio=1.0)),
+    ]
+
+    plt.figure(figsize=(11, 6))
+    plt.errorbar(wl_c, depth, yerr=[elo, ehi], fmt="o", capsize=3, label="Observed (MCMC)")
+
+    for label, atm in models:
+        depth_model = platon_transit_depths_at_wavelengths(wl_c, planet, atm)
+        plt.plot(wl_c, depth_model, label=f"PLATON: {label}")
+
+    plt.xlabel("Wavelength (micron)")
+    plt.ylabel("Transit depth (Rp/R*)^2")
+    plt.title("WASP-39b: Observed Transmission Spectrum vs PLATON Forward Models")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out_png = os.path.join(out_dir, "transmission_spectrum_with_platon.png")
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+    print(f"Saved: {out_png}")
 
 
 if __name__ == "__main__":
