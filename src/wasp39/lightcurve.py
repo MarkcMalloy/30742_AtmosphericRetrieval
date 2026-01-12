@@ -31,6 +31,12 @@ def batman_model(t: np.ndarray, cfg: TransitConfig, rp: float) -> np.ndarray:
     m = batman.TransitModel(params, t)
     return m.light_curve(params)
 
+def batman_model_with_linear_baseline(t: np.ndarray, cfg: TransitConfig, rp: float, c0: float, c1: float, t_ref: float) -> np.ndarray:
+    transit = batman_model(t, cfg, rp)
+    baseline = c0 + c1 * (t - t_ref)
+    return baseline * transit
+
+
 
 def batman_model_fixed_except_rp(t: np.ndarray, cfg: TransitConfig, rp: float) -> np.ndarray:
     # alias kept for compatibility with your existing naming
