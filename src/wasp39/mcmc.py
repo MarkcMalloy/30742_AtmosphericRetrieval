@@ -115,9 +115,9 @@ def fit_white_light_mcmc(
     progress: bool = True,
     # Priors (loosely following your Proj_WASP.py)
     t0_width: float = 0.1,
-    per_bounds: Tuple[float, float] = (4.045, 4.065),
-    a_bounds: Tuple[float, float] = (10.5, 12.0),
-    inc_bounds: Tuple[float, float] = (86.5, 88.5),
+    per_bounds: Tuple[float, float] = (4.04,4.180),
+    a_bounds: Tuple[float, float] = (10.90, 11.5),
+    inc_bounds: Tuple[float, float] = (86.9, 88),
     rp_bounds: Tuple[float, float] = (0.13, 0.16),
     u_bounds: Tuple[float, float] = (-1.0, 1.0),
     c0_bounds: Tuple[float, float] = (0.9, 1.1),
@@ -125,6 +125,12 @@ def fit_white_light_mcmc(
     # Optional Gaussian priors on limb darkening (u1,u2)
     u_gauss_mu: Optional[Tuple[float, float]] = None,
     u_gauss_sigma: Union[float, Tuple[float, float]] = 0.05,
+    # Optional Gaussian priors on per and a
+    per_gauss_mu: Optional[float] = None,
+    per_gauss_sigma: Optional[float] = None,
+    a_gauss_mu: Optional[float] = None,
+    a_gauss_sigma: Optional[float] = None,
+
 ) -> Tuple[np.ndarray, list, np.ndarray, np.ndarray]:
     """
     White-light MCMC fit: transit (BATMAN) * linear baseline.
@@ -164,6 +170,12 @@ def fit_white_light_mcmc(
         0.0,   # c1
     ], dtype=float)
 
+
+    def gauss_lnprior(x: float, mu: float, sigma: float) -> float:
+        if sigma <= 0:
+            return -np.inf
+        return -0.5 * ((x - mu) / sigma) ** 2 - np.log(sigma * np.sqrt(2.0 * np.pi))
+
     # --- log prior (flat bounds) ---
     def log_prior(p: np.ndarray) -> float:
         t0, per, a, inc, rp, u1, u2, c0, c1 = p
@@ -179,6 +191,18 @@ def fit_white_light_mcmc(
         if not (c1_bounds[0] < c1 < c1_bounds[1]):                 return -np.inf
 
         lp = 0.0
+
+        # Optional Gaussian prior on period
+        if per_gauss_mu is not None:
+            if per_gauss_sigma is None:
+                return -np.inf
+            lp += gauss_lnprior(float(per), float(per_gauss_mu), float(per_gauss_sigma))
+
+        # Optional Gaussian prior on a (a/R*)
+        if a_gauss_mu is not None:
+            if a_gauss_sigma is None:
+                return -np.inf
+            lp += gauss_lnprior(float(a), float(a_gauss_mu), float(a_gauss_sigma))
 
         # Optional Gaussian priors on limb darkening
         if u_gauss_mu is not None:
@@ -226,7 +250,31 @@ def fit_white_light_mcmc(
         return lp + log_likelihood_full(p)
 
     ndim = len(p_init)
-    pos0 = p_init + 1e-4 * np.random.randn(nwalkers, ndim)
+    # Better initialization scales per parameter (helps exploration, esp. for per)
+    scales = np.array([
+        0.005,  # t0 (days)
+        0.02 * p_init[1],  # per (days) ~2% scatter
+        0.05,  # a
+        0.05,  # inc (deg)
+        0.002,  # rp
+        0.02,  # u1
+        0.02,  # u2
+        0.01,  # c0
+        1e-4,  # c1
+    ], dtype=float)
+
+    pos0 = p_init + scales * np.random.randn(nwalkers, ndim)
+
+    # Clip into hard bounds so you don't start at -inf
+    pos0[:, 0] = np.clip(pos0[:, 0], p_init[0] - t0_width, p_init[0] + t0_width)
+    pos0[:, 1] = np.clip(pos0[:, 1], per_bounds[0], per_bounds[1])
+    pos0[:, 2] = np.clip(pos0[:, 2], a_bounds[0], a_bounds[1])
+    pos0[:, 3] = np.clip(pos0[:, 3], inc_bounds[0], inc_bounds[1])
+    pos0[:, 4] = np.clip(pos0[:, 4], rp_bounds[0], rp_bounds[1])
+    pos0[:, 5] = np.clip(pos0[:, 5], u_bounds[0], u_bounds[1])
+    pos0[:, 6] = np.clip(pos0[:, 6], u_bounds[0], u_bounds[1])
+    pos0[:, 7] = np.clip(pos0[:, 7], c0_bounds[0], c0_bounds[1])
+    pos0[:, 8] = np.clip(pos0[:, 8], c1_bounds[0], c1_bounds[1])
 
     sampler = emcee.EnsembleSampler(nwalkers, ndim, logprob)
     sampler.run_mcmc(pos0, nsteps_burn, progress=progress)

@@ -88,10 +88,19 @@ def run_white_light(ctx: dict, t, flux, flux_err, tag: str) -> None:
 
 
 def Step4(ctx: dict) -> None:
-    print("STEP 4 — Run white-light MCMC (unbinned + binned, Gaussian LD priors)")
+    mode = ctx.get("white_light_mode", "both")  # "unbinned", "binned", or "both"
+    propagate = ctx.get("white_light_propagate", None)  # "unbinned" or "binned" (optional)
+
+    print(f"STEP 4 — Run white-light MCMC (mode={mode})")
 
     u1_mu, u2_mu = 0.25, 0.30   # replace later with theory values
     u_sigma = 0.05              # conservative, but effective
+
+    per_mu = float(ctx["cfg_init"].per)
+    per_sigma = 0.002  # days (~2.9 minutes). adjust if needed
+
+    a_mu = float(ctx["cfg_init"].a)
+    a_sigma = 0.20  # tune if needed
 
     def run_white_light(t, flux, flux_err, tag):
         chain, labels, best_params, best_model = fit_white_light_mcmc(
@@ -100,13 +109,17 @@ def Step4(ctx: dict) -> None:
             flux_err=flux_err,
             cfg_init=ctx["cfg_init"],
             rp_init=ctx["rp_init"],
-            nwalkers=50,
-            nsteps_burn=2000,
-            nsteps_prod=2000,
+            nwalkers=64,
+            nsteps_burn=3000,
+            nsteps_prod=8000,
             thin=15,
             progress=True,
             u_gauss_mu=(u1_mu, u2_mu),
             u_gauss_sigma=u_sigma,
+            per_gauss_mu=per_mu,
+            per_gauss_sigma=per_sigma,
+            a_gauss_mu=a_mu,
+            a_gauss_sigma=a_sigma,
         )
 
         save_corner(
@@ -120,8 +133,6 @@ def Step4(ctx: dict) -> None:
             f"Best-fit + residuals ({tag})"
         )
 
-
-        # Save best-fit so Step5/6 can run without rerunning MCMC
         out_npz = os.path.join(ctx["out"], f"white_light_bestfit_{tag}.npz")
         np.savez(
             out_npz,
@@ -132,21 +143,35 @@ def Step4(ctx: dict) -> None:
         )
         print(f"Saved white-light best-fit ({tag}) to: {out_npz}")
 
-
         return best_params
 
-    # --- unbinned ---
-    best_unbinned = run_white_light(
-        ctx["bjd"], ctx["white"], ctx["white_e"], "unbinned"
-    )
+    results = {}
 
-    # --- binned ---
-    best_binned = run_white_light(
-        ctx["bjd_b"], ctx["white_b"], ctx["white_be"], "binned"
-    )
+    if mode in ("unbinned", "both"):
+        results["unbinned"] = run_white_light(
+            ctx["bjd"], ctx["white"], ctx["white_e"], "unbinned"
+        )
 
-    # Choose which solution to propagate (recommend: unbinned)
-    best = best_unbinned
+    if mode in ("binned", "both"):
+        results["binned"] = run_white_light(
+            ctx["bjd_b"], ctx["white_b"], ctx["white_be"], "binned"
+        )
+
+    if not results:
+        raise ValueError(f"Invalid white_light_mode={mode!r}. Use 'unbinned', 'binned', or 'both'.")
+
+    # Decide which solution to propagate
+    if propagate is None:
+        # sensible default: if only one ran, use it; if both ran, default to unbinned
+        propagate = next(iter(results.keys())) if len(results) == 1 else "unbinned"
+
+    if propagate not in results:
+        raise ValueError(
+            f"white_light_propagate={propagate!r} not available (ran: {list(results.keys())})."
+        )
+
+    best = results[propagate]
+    ctx["white_light_tag"] = propagate  # useful for later steps if you want
 
     t0, per, a, inc, rp, u1, u2, *_ = best
     ctx["cfg"] = TransitConfig(
@@ -158,6 +183,8 @@ def Step4(ctx: dict) -> None:
         limb_dark="quadratic",
     )
     ctx["rp_fit"] = float(rp)
+
+    print(f"Propagating white-light solution: {propagate}")
 
 
 def Step5(ctx: dict, *, n_wl_bins: int, spec_time_bin: int, white_tag: str = "unbinned") -> None:
@@ -264,11 +291,9 @@ def Step6(ctx: dict, *, white_tag: str = "binned") -> None:
         "H2": 0.94,
         "He": 0.05,
         # trace gases (tune these)
-        "CH4": 3e-4,
-        "CO": 2e-4,
+        "CH4": 3e-2,
         "CO2": 1e-4,
         "H2O": 2e-3,
-        "NH3": 1e-4,
     }
 
     abund = build_custom_abundances(
@@ -481,6 +506,7 @@ def main() -> None:
 
 
     ctx: dict = {}
+    ctx["white_light_mode"] = "binned"
     Step = {
         0: lambda: Step0(ctx),
         1: lambda: Step1(ctx),
