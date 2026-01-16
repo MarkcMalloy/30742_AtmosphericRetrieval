@@ -97,10 +97,30 @@ def Step4(ctx: dict) -> None:
     u_sigma = 0.05              # conservative, but effective
 
     per_mu = float(ctx["cfg_init"].per)
-    per_sigma = 0.002  # days (~2.9 minutes). adjust if needed
+    per_sigma = 0.001  # days (~2.9 minutes). adjust if needed
 
     a_mu = float(ctx["cfg_init"].a)
     a_sigma = 0.20  # tune if needed
+
+    def derive_inc_deg(a: float, b: float) -> float:
+        # b = a*cos(i)  -> i = arccos(b/a)
+        cosi = b / a
+        cosi = float(np.clip(cosi, -1.0, 1.0))
+        return float(np.degrees(np.arccos(cosi)))
+
+    def print_best_params(tag: str, labels: list, best_params: np.ndarray, inc_deg: float) -> None:
+        vals = dict(zip(labels, best_params))
+        print(f"\n[white-light best-fit | {tag}]")
+        print(f"  t0  = {vals['t0']:.8f}")
+        print(f"  per = {vals['per']:.8f} d")
+        print(f"  a   = {vals['a']:.6f} (a/R*)")
+        print(f"  b   = {vals['b']:.6f}")
+        print(f"  inc = {inc_deg:.6f} deg  (derived from b/a)")
+        print(f"  rp  = {vals['rp']:.6f} (Rp/R*)")
+        print(f"  u1  = {vals['u1']:.6f}")
+        print(f"  u2  = {vals['u2']:.6f}")
+        print(f"  c0  = {vals['c0']:.6f}")
+        print(f"  c1  = {vals['c1']:.6e}")
 
     def run_white_light(t, flux, flux_err, tag):
         chain, labels, best_params, best_model = fit_white_light_mcmc(
@@ -122,6 +142,15 @@ def Step4(ctx: dict) -> None:
             a_gauss_sigma=a_sigma,
         )
 
+        # Expect: labels == ["t0","per","a","b","rp","u1","u2","c0","c1"]
+        # Derive inclination from best-fit (a,b)
+        a_best = float(best_params[2])
+        b_best = float(best_params[3])
+        inc_best = derive_inc_deg(a_best, b_best)
+
+        # Print best-fit summary
+        print_best_params(tag, labels, best_params, inc_best)
+
         save_corner(
             os.path.join(ctx["out"], f"04_corner_white_light_{tag}.png"),
             chain, labels
@@ -133,36 +162,54 @@ def Step4(ctx: dict) -> None:
             f"Best-fit + residuals ({tag})"
         )
 
+        # Save best-fit so Step5/6 can run without rerunning MCMC
         out_npz = os.path.join(ctx["out"], f"white_light_bestfit_{tag}.npz")
+
+        # Save original best_params plus an "inc" appended version
+        labels_with_inc = list(labels) + ["inc"]
+        best_params_with_inc = np.concatenate([best_params.astype(float), np.array([inc_best], dtype=float)])
+
         np.savez(
             out_npz,
             labels=np.array(labels, dtype=object),
             best_params=np.array(best_params, dtype=float),
+
+            labels_with_inc=np.array(labels_with_inc, dtype=object),
+            best_params_with_inc=np.array(best_params_with_inc, dtype=float),
+
+            inc_best=np.array([inc_best], dtype=float),
+
             u_gauss_mu=np.array([u1_mu, u2_mu], dtype=float),
             u_gauss_sigma=np.array([u_sigma], dtype=float),
-        )
-        print(f"Saved white-light best-fit ({tag}) to: {out_npz}")
 
-        return best_params
+            per_gauss_mu=np.array([per_mu], dtype=float),
+            per_gauss_sigma=np.array([per_sigma], dtype=float),
+            a_gauss_mu=np.array([a_mu], dtype=float),
+            a_gauss_sigma=np.array([a_sigma], dtype=float),
+        )
+        print(f"Saved white-light best-fit ({tag}) to: {out_npz}\n")
+
+        return best_params, inc_best
 
     results = {}
 
     if mode in ("unbinned", "both"):
-        results["unbinned"] = run_white_light(
+        best_params, inc_best = run_white_light(
             ctx["bjd"], ctx["white"], ctx["white_e"], "unbinned"
         )
+        results["unbinned"] = (best_params, inc_best)
 
     if mode in ("binned", "both"):
-        results["binned"] = run_white_light(
+        best_params, inc_best = run_white_light(
             ctx["bjd_b"], ctx["white_b"], ctx["white_be"], "binned"
         )
+        results["binned"] = (best_params, inc_best)
 
     if not results:
         raise ValueError(f"Invalid white_light_mode={mode!r}. Use 'unbinned', 'binned', or 'both'.")
 
     # Decide which solution to propagate
     if propagate is None:
-        # sensible default: if only one ran, use it; if both ran, default to unbinned
         propagate = next(iter(results.keys())) if len(results) == 1 else "unbinned"
 
     if propagate not in results:
@@ -170,21 +217,24 @@ def Step4(ctx: dict) -> None:
             f"white_light_propagate={propagate!r} not available (ran: {list(results.keys())})."
         )
 
-    best = results[propagate]
+    best_params, inc_best = results[propagate]
     ctx["white_light_tag"] = propagate  # useful for later steps if you want
 
-    t0, per, a, inc, rp, u1, u2, *_ = best
+    # Unpack sampled params: t0, per, a, b, rp, u1, u2, c0, c1
+    t0, per, a, b, rp, u1, u2, *_ = best_params
+
     ctx["cfg"] = TransitConfig(
         t0=float(t0),
         per=float(per),
         a=float(a),
-        inc=float(inc),
+        inc=float(inc_best),  # derived
         u=(float(u1), float(u2)),
         limb_dark="quadratic",
     )
     ctx["rp_fit"] = float(rp)
 
     print(f"Propagating white-light solution: {propagate}")
+    print(f"Derived inclination used for cfg: inc={inc_best:.6f} deg (b={float(b):.6f}, a={float(a):.6f})")
 
 
 def Step5(ctx: dict, *, n_wl_bins: int, spec_time_bin: int, white_tag: str = "unbinned") -> None:

@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
 
 from .binning import make_binned_lightcurve_for_wlbin, bin_time_series
 from .normalize import normalize_by_oot
-from .mcmc import fit_one_bin_mcmc
+from .mcmc import fit_white_light_mcmc
 from .lightcurve import TransitConfig
 
 
@@ -33,9 +33,9 @@ def _fit_bin_depth_worker(
         k, w0, w1, depth_med, depth_err_lo, depth_err_hi
     """
     # Import inside worker for Windows spawn safety
-    from .mcmc import fit_one_bin_mcmc
+    from .mcmc import fit_white_light_mcmc
 
-    samples_rp, _ = fit_one_bin_mcmc(
+    samples_rp, _ = fit_white_light_mcmc(
         t_use,
         f_use,
         e_use,

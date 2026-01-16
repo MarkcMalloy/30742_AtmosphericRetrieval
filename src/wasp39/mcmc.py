@@ -1,4 +1,7 @@
+
 from __future__ import annotations
+import multiprocessing as mp
+from dataclasses import dataclass
 
 import numpy as np
 import emcee
@@ -7,283 +10,183 @@ from dataclasses import replace
 
 from .lightcurve import TransitConfig, batman_model
 
-
-def log_likelihood(theta: np.ndarray, t: np.ndarray, y: np.ndarray, yerr: np.ndarray,
-                   model_fn: Callable[[np.ndarray, np.ndarray], np.ndarray]) -> float:
-    model = model_fn(t, theta)
-    inv_sigma2 = 1.0 / (yerr ** 2)
-    return -0.5 * np.sum((y - model) ** 2 * inv_sigma2 + np.log(2.0 * np.pi / inv_sigma2))
+N_CORES = 8
 
 
+@dataclass
+class WhiteLightLogProb:
+    t_rel: np.ndarray
+    flux: np.ndarray
+    flux_err: np.ndarray
+    t_ref: float
+    limb_dark: str
 
-def run_emcee(
-    logprob_fn: Callable[[np.ndarray], float],
-    ndim: int,
-    nwalkers: int,
-    p0: np.ndarray,
-    nsteps_burn: int,
-    nsteps_prod: int,
-    progress: bool = True,
-) -> emcee.EnsembleSampler:
-    sampler = emcee.EnsembleSampler(nwalkers, ndim, logprob_fn)
-    sampler.run_mcmc(p0, nsteps_burn, progress=progress)
-    state = sampler.get_last_sample()
-    sampler.run_mcmc(state, nsteps_prod, progress=progress)
-    return sampler
+    t0_init: float
+    t0_width: float
 
+    per_bounds: Tuple[float, float]
+    a_bounds: Tuple[float, float]
+    b_bounds: Tuple[float, float]
+    rp_bounds: Tuple[float, float]
+    u_bounds: Tuple[float, float]
+    c0_bounds: Tuple[float, float]
+    c1_bounds: Tuple[float, float]
 
-# --- Bin-depth (Rp/R*) MCMC helpers ---
+    u_gauss_mu: Optional[Tuple[float, float]] = None
+    u_gauss_sigma: Union[float, Tuple[float, float]] = 0.05
+    per_gauss_mu: Optional[float] = None
+    per_gauss_sigma: Optional[float] = None
+    a_gauss_mu: Optional[float] = None
+    a_gauss_sigma: Optional[float] = None
 
-def logprior_rp(rp: float, rp_bounds: Tuple[float, float]) -> float:
-    lo, hi = rp_bounds
-    return 0.0 if (lo < rp < hi) else -np.inf
-
-
-def fit_one_bin_mcmc(
-    t: np.ndarray,
-    flux: np.ndarray,
-    flux_err: np.ndarray,
-    cfg: TransitConfig,
-    rp_init: float,
-    rp_bounds: Tuple[float, float] = (0.05, 0.3),
-    nwalkers: int = 32,
-    nsteps_burn: int = 2000,
-    nsteps_prod: int = 3000,
-    progress: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Fit Rp/R* for a single wavelength bin using emcee.
-    Numerically stable time: uses t_rel = t - median(t) internally for BATMAN.
-    Returns:
-        samples_rp: (n_samples,)
-        model_median: (len(t),)
-    """
-    # --- ensure float arrays ---
-    t = np.asarray(t, dtype=float)
-    flux = np.asarray(flux, dtype=float)
-    flux_err = np.asarray(flux_err, dtype=float)
-
-    # --- numerically stable time ---
-    t_ref = float(np.median(t))
-    t_rel = t - t_ref
-
-    # shift t0 into the same relative frame for BATMAN
-    cfg_rel = TransitConfig(
-        t0=float(cfg.t0) - t_ref,
-        per=float(cfg.per),
-        a=float(cfg.a),
-        inc=float(cfg.inc),
-        u=(float(cfg.u[0]), float(cfg.u[1])),
-        limb_dark=cfg.limb_dark,
-    )
-
-    def logprob(theta: np.ndarray) -> float:
-        rp = float(theta[0])
-        lp = logprior_rp(rp, rp_bounds)
-        if not np.isfinite(lp):
-            return -np.inf
-
-        model = batman_model(t_rel, cfg_rel, rp)
-        inv_sigma2 = 1.0 / (flux_err ** 2)
-        ll = -0.5 * np.sum((flux - model) ** 2 * inv_sigma2 + np.log(2.0 * np.pi / inv_sigma2))
-        return lp + ll
-
-    ndim = 1
-    p0 = rp_init + 1e-4 * np.random.randn(nwalkers, ndim)
-    sampler = run_emcee(logprob, ndim, nwalkers, p0, nsteps_burn, nsteps_prod, progress=progress)
-
-    flat = sampler.get_chain(discard=0, flat=True)
-    samples = flat[:, 0]
-    rp_med = np.median(samples)
-
-    # evaluate model at median (still returned on original time grid length)
-    model_med = batman_model(t_rel, cfg_rel, rp_med)
-    return samples, model_med
-
-
-def fit_white_light_mcmc(
-    t: np.ndarray,
-    flux: np.ndarray,
-    flux_err: np.ndarray,
-    cfg_init: TransitConfig,
-    rp_init: float,
-    *,
-    nwalkers: int = 50,
-    nsteps_burn: int = 2000,
-    nsteps_prod: int = 2000,
-    thin: int = 15,
-    progress: bool = True,
-    # Priors (loosely following your Proj_WASP.py)
-    t0_width: float = 0.1,
-    per_bounds: Tuple[float, float] = (4.04,4.180),
-    a_bounds: Tuple[float, float] = (10.90, 11.5),
-    inc_bounds: Tuple[float, float] = (86.9, 88),
-    rp_bounds: Tuple[float, float] = (0.13, 0.16),
-    u_bounds: Tuple[float, float] = (-1.0, 1.0),
-    c0_bounds: Tuple[float, float] = (0.9, 1.1),
-    c1_bounds: Tuple[float, float] = (-0.01, 0.01),
-    # Optional Gaussian priors on limb darkening (u1,u2)
-    u_gauss_mu: Optional[Tuple[float, float]] = None,
-    u_gauss_sigma: Union[float, Tuple[float, float]] = 0.05,
-    # Optional Gaussian priors on per and a
-    per_gauss_mu: Optional[float] = None,
-    per_gauss_sigma: Optional[float] = None,
-    a_gauss_mu: Optional[float] = None,
-    a_gauss_sigma: Optional[float] = None,
-
-) -> Tuple[np.ndarray, list, np.ndarray, np.ndarray]:
-    """
-    White-light MCMC fit: transit (BATMAN) * linear baseline.
-
-    Parameters sampled (absolute t0):
-        [t0, per, a, inc, rp, u1, u2, c0, c1]
-
-    Numerically stable time:
-        Uses t_rel = t - median(t) internally for BATMAN and baseline.
-
-    Returns:
-        chain_flat: (Nsamples, 9)
-        labels: list[str]
-        best_params: (9,) median of posterior (t0 remains absolute BJD)
-        best_model: (len(t),) model evaluated at best_params
-    """
-    t = np.asarray(t, dtype=float)
-    flux = np.asarray(flux, dtype=float)
-    flux_err = np.asarray(flux_err, dtype=float)
-
-    # --- numerically stable time ---
-    t_ref = float(np.median(t))
-    t_rel = t - t_ref
-
-    labels = ["t0", "per", "a", "inc", "rp", "u1", "u2", "c0", "c1"]
-
-    # --- initial parameter vector (from cfg_init + rp_init) ---
-    p_init = np.array([
-        float(cfg_init.t0),   # absolute
-        float(cfg_init.per),
-        float(cfg_init.a),
-        float(cfg_init.inc),
-        float(rp_init),
-        float(cfg_init.u[0]),
-        float(cfg_init.u[1]),
-        1.0,   # c0
-        0.0,   # c1
-    ], dtype=float)
-
-
+    @staticmethod
     def gauss_lnprior(x: float, mu: float, sigma: float) -> float:
         if sigma <= 0:
             return -np.inf
         return -0.5 * ((x - mu) / sigma) ** 2 - np.log(sigma * np.sqrt(2.0 * np.pi))
 
-    # --- log prior (flat bounds) ---
-    def log_prior(p: np.ndarray) -> float:
-        t0, per, a, inc, rp, u1, u2, c0, c1 = p
+    def log_prior(self, p: np.ndarray) -> float:
+        t0, per, a, b, rp, u1, u2, c0, c1 = p
 
-        if not (p_init[0] - t0_width < t0 < p_init[0] + t0_width): return -np.inf
-        if not (per_bounds[0] < per < per_bounds[1]):              return -np.inf
-        if not (a_bounds[0] < a < a_bounds[1]):                    return -np.inf
-        if not (inc_bounds[0] < inc < inc_bounds[1]):              return -np.inf
-        if not (rp_bounds[0] < rp < rp_bounds[1]):                 return -np.inf
-        if not (u_bounds[0] < u1 < u_bounds[1]):                   return -np.inf
-        if not (u_bounds[0] < u2 < u_bounds[1]):                   return -np.inf
-        if not (c0_bounds[0] < c0 < c0_bounds[1]):                 return -np.inf
-        if not (c1_bounds[0] < c1 < c1_bounds[1]):                 return -np.inf
+        if not (self.t0_init - self.t0_width < t0 < self.t0_init + self.t0_width):
+            return -np.inf
+        if not (self.per_bounds[0] < per < self.per_bounds[1]):
+            return -np.inf
+        if not (self.a_bounds[0] < a < self.a_bounds[1]):
+            return -np.inf
+        if not (self.b_bounds[0] < b < self.b_bounds[1]):
+            return -np.inf
+        if b >= a:
+            return -np.inf
+        if not (self.rp_bounds[0] < rp < self.rp_bounds[1]):
+            return -np.inf
+        if not (self.u_bounds[0] < u1 < self.u_bounds[1]):
+            return -np.inf
+        if not (self.u_bounds[0] < u2 < self.u_bounds[1]):
+            return -np.inf
+        if not (self.c0_bounds[0] < c0 < self.c0_bounds[1]):
+            return -np.inf
+        if not (self.c1_bounds[0] < c1 < self.c1_bounds[1]):
+            return -np.inf
 
         lp = 0.0
 
-        # Optional Gaussian prior on period
-        if per_gauss_mu is not None:
-            if per_gauss_sigma is None:
-                return -np.inf
-            lp += gauss_lnprior(float(per), float(per_gauss_mu), float(per_gauss_sigma))
+        if self.per_gauss_mu is not None:
+            lp += self.gauss_lnprior(per, self.per_gauss_mu, self.per_gauss_sigma)
+        if self.a_gauss_mu is not None:
+            lp += self.gauss_lnprior(a, self.a_gauss_mu, self.a_gauss_sigma)
 
-        # Optional Gaussian prior on a (a/R*)
-        if a_gauss_mu is not None:
-            if a_gauss_sigma is None:
-                return -np.inf
-            lp += gauss_lnprior(float(a), float(a_gauss_mu), float(a_gauss_sigma))
-
-        # Optional Gaussian priors on limb darkening
-        if u_gauss_mu is not None:
-            mu1, mu2 = u_gauss_mu
-            if isinstance(u_gauss_sigma, tuple):
-                sig1, sig2 = u_gauss_sigma
-            else:
-                sig1 = float(u_gauss_sigma)
-                sig2 = float(u_gauss_sigma)
-            if sig1 <= 0 or sig2 <= 0:
-                return -np.inf
-            lp += -0.5 * ((u1 - mu1) / sig1) ** 2 - np.log(sig1 * np.sqrt(2.0 * np.pi))
-            lp += -0.5 * ((u2 - mu2) / sig2) ** 2 - np.log(sig2 * np.sqrt(2.0 * np.pi))
+        if self.u_gauss_mu is not None:
+            mu1, mu2 = self.u_gauss_mu
+            sig1 = sig2 = self.u_gauss_sigma if not isinstance(self.u_gauss_sigma, tuple) else self.u_gauss_sigma
+            lp += self.gauss_lnprior(u1, mu1, sig1)
+            lp += self.gauss_lnprior(u2, mu2, sig2)
 
         return lp
 
-    # --- model ---
-    def model_from_params(p: np.ndarray) -> np.ndarray:
-        # NOTE: t0 stays absolute in p, but BATMAN uses relative time,
-        # so we shift t0 into the same frame: t0_rel = t0 - t_ref
-        t0, per, a, inc, rp, u1, u2, c0, c1 = p
-        cfg = TransitConfig(
-            t0=float(t0) - t_ref,  # shifted for BATMAN
-            per=float(per),
-            a=float(a),
-            inc=float(inc),
-            u=(float(u1), float(u2)),
-            limb_dark=cfg_init.limb_dark,
-        )
-        transit = batman_model(t_rel, cfg, float(rp))
+    def model_from_params(self, p: np.ndarray) -> np.ndarray:
+        t0, per, a, b, rp, u1, u2, c0, c1 = p
+        inc = np.degrees(np.arccos(np.clip(b / a, -1.0, 1.0)))
 
-        # baseline in the same relative frame (more stable than (t - mean(t)))
-        baseline = float(c0) + float(c1) * t_rel
+        cfg = TransitConfig(
+            t0=t0 - self.t_ref,
+            per=per,
+            a=a,
+            inc=inc,
+            u=(u1, u2),
+            limb_dark=self.limb_dark,
+        )
+
+        transit = batman_model(self.t_rel, cfg, rp)
+        baseline = c0 + c1 * self.t_rel
         return transit * baseline
 
-    def log_likelihood_full(p: np.ndarray) -> float:
-        m = model_from_params(p)
-        inv_sigma2 = 1.0 / (flux_err ** 2)
-        return -0.5 * np.sum((flux - m) ** 2 * inv_sigma2 + np.log(2.0 * np.pi / inv_sigma2))
-
-    def logprob(p: np.ndarray) -> float:
-        lp = log_prior(p)
+    def __call__(self, p: np.ndarray) -> float:
+        lp = self.log_prior(p)
         if not np.isfinite(lp):
             return -np.inf
-        return lp + log_likelihood_full(p)
+
+        model = self.model_from_params(p)
+        inv_sigma2 = 1.0 / (self.flux_err ** 2)
+        return -0.5 * np.sum((self.flux - model) ** 2 * inv_sigma2 + np.log(2 * np.pi / inv_sigma2)) + lp
+
+
+def fit_white_light_mcmc(
+    t, flux, flux_err, cfg_init, rp_init,
+    nwalkers=64, nsteps_burn=3000, nsteps_prod=8000, thin=1, progress=True,
+    t0_width=0.1,
+    per_bounds=(3.5, 4.5),
+    a_bounds=(10.0, 13.0),
+    b_bounds=(0.0, 1.2),
+    rp_bounds=(0.1, 0.2),
+    u_bounds=(-1.0, 1.0),
+    c0_bounds=(0.9, 1.1),
+    c1_bounds=(-0.01, 0.01),
+    u_gauss_mu=None,
+    u_gauss_sigma=0.05,
+    per_gauss_mu=None,
+    per_gauss_sigma=None,
+    a_gauss_mu=None,
+    a_gauss_sigma=None,
+):
+    t = np.asarray(t, float)
+    flux = np.asarray(flux, float)
+    flux_err = np.asarray(flux_err, float)
+
+    t_ref = np.median(t)
+    t_rel = t - t_ref
+
+    b_init = cfg_init.a * np.cos(np.deg2rad(cfg_init.inc))
+
+    p_init = np.array([
+        cfg_init.t0,
+        cfg_init.per,
+        cfg_init.a,
+        b_init,
+        rp_init,
+        cfg_init.u[0],
+        cfg_init.u[1],
+        1.0,
+        0.0,
+    ])
 
     ndim = len(p_init)
-    # Better initialization scales per parameter (helps exploration, esp. for per)
-    scales = np.array([
-        0.005,  # t0 (days)
-        0.02 * p_init[1],  # per (days) ~2% scatter
-        0.05,  # a
-        0.05,  # inc (deg)
-        0.002,  # rp
-        0.02,  # u1
-        0.02,  # u2
-        0.01,  # c0
-        1e-4,  # c1
-    ], dtype=float)
-
+    scales = np.array([0.005, 0.02*p_init[1], 0.05, 0.02, 0.002, 0.02, 0.02, 0.01, 1e-4])
     pos0 = p_init + scales * np.random.randn(nwalkers, ndim)
 
-    # Clip into hard bounds so you don't start at -inf
-    pos0[:, 0] = np.clip(pos0[:, 0], p_init[0] - t0_width, p_init[0] + t0_width)
-    pos0[:, 1] = np.clip(pos0[:, 1], per_bounds[0], per_bounds[1])
-    pos0[:, 2] = np.clip(pos0[:, 2], a_bounds[0], a_bounds[1])
-    pos0[:, 3] = np.clip(pos0[:, 3], inc_bounds[0], inc_bounds[1])
-    pos0[:, 4] = np.clip(pos0[:, 4], rp_bounds[0], rp_bounds[1])
-    pos0[:, 5] = np.clip(pos0[:, 5], u_bounds[0], u_bounds[1])
-    pos0[:, 6] = np.clip(pos0[:, 6], u_bounds[0], u_bounds[1])
-    pos0[:, 7] = np.clip(pos0[:, 7], c0_bounds[0], c0_bounds[1])
-    pos0[:, 8] = np.clip(pos0[:, 8], c1_bounds[0], c1_bounds[1])
+    logprob = WhiteLightLogProb(
+        t_rel=t_rel,
+        flux=flux,
+        flux_err=flux_err,
+        t_ref=t_ref,
+        limb_dark=cfg_init.limb_dark,
+        t0_init=p_init[0],
+        t0_width=t0_width,
+        per_bounds=per_bounds,
+        a_bounds=a_bounds,
+        b_bounds=b_bounds,
+        rp_bounds=rp_bounds,
+        u_bounds=u_bounds,
+        c0_bounds=c0_bounds,
+        c1_bounds=c1_bounds,
+        u_gauss_mu=u_gauss_mu,
+        u_gauss_sigma=u_gauss_sigma,
+        per_gauss_mu=per_gauss_mu,
+        per_gauss_sigma=per_gauss_sigma,
+        a_gauss_mu=a_gauss_mu,
+        a_gauss_sigma=a_gauss_sigma,
+    )
 
-    sampler = emcee.EnsembleSampler(nwalkers, ndim, logprob)
-    sampler.run_mcmc(pos0, nsteps_burn, progress=progress)
-    state = sampler.get_last_sample()
-    sampler.run_mcmc(state, nsteps_prod, progress=progress)
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=N_CORES) as pool:
+        sampler = emcee.EnsembleSampler(nwalkers, ndim, logprob, pool=pool)
+        sampler.run_mcmc(pos0, nsteps_burn, progress=progress)
+        state = sampler.get_last_sample()
+        sampler.run_mcmc(state, nsteps_prod, progress=progress)
 
-    chain_flat = sampler.get_chain(discard=max(1, nsteps_burn // 2), thin=thin, flat=True)
+    chain = sampler.get_chain(discard=nsteps_burn//2, thin=thin, flat=True)
+    best_params = np.median(chain, axis=0)
+    best_model = logprob.model_from_params(best_params)
 
-    best_params = np.median(chain_flat, axis=0)     # t0 remains absolute
-    best_model = model_from_params(best_params)
-
-    return chain_flat, labels, best_params, best_model
+    labels = ["t0","per","a","b","rp","u1","u2","c0","c1"]
+    return chain, labels, best_params, best_model
