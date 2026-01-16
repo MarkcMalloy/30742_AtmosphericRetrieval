@@ -7,7 +7,7 @@ def main():
     sys.argv = [
         "python -m wasp39.main",
         #"--steps", "0,1,2,3,4",
-        "--steps", "0,1,5",
+        "--steps", "6,7",
     ]
 
     from wasp39.main import main as pipeline_main

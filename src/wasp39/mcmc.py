@@ -15,6 +15,7 @@ def log_likelihood(theta: np.ndarray, t: np.ndarray, y: np.ndarray, yerr: np.nda
     return -0.5 * np.sum((y - model) ** 2 * inv_sigma2 + np.log(2.0 * np.pi / inv_sigma2))
 
 
+
 def run_emcee(
     logprob_fn: Callable[[np.ndarray], float],
     ndim: int,
