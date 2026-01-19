@@ -424,11 +424,67 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
         T_star=float(getattr(base_cfg, "tstar_k", 5400.0)),
     )
 
-    # Baseline fit params
-    fit_info.add_uniform_fit_param("R", 0.9 * Rp_m, 1.1 * Rp_m)
-    fit_info.add_uniform_fit_param("T", 0.5 * T, 1.5 * T)
-    fit_info.add_uniform_fit_param("logZ", -1.0, 3.0)
-    fit_info.add_uniform_fit_param("CO_ratio", 0.05, 2.0)
+    # ------------------------------------------------------------------
+    # Baseline fit params (robust to PLATON parameter naming)
+    # ------------------------------------------------------------------
+    # FitInfo requires the param to already exist in fit_info.all_params
+    available = list(getattr(fit_info, "all_params", {}).keys())
+    print("PLATON FitInfo parameters available:")
+    print("  " + ", ".join(available))
+
+    def add_uniform_if_exists(name: str, lo: float, hi: float) -> bool:
+        if name in fit_info.all_params:
+            fit_info.add_uniform_fit_param(name, lo, hi)
+            return True
+        return False
+
+    def add_gaussian_if_exists(name: str, mean: float, sigma: float) -> bool:
+        if name in fit_info.all_params and hasattr(fit_info, "add_gaussian_fit_param"):
+            # PLATON 6.3 expects positional args: (name, mean, sigma)
+            fit_info.add_gaussian_fit_param(name, mean, sigma)
+            return True
+        return False
+
+    # --- Radius parameter name differs by PLATON version/config ---
+    # Try the common ones in order:
+    radius_set = (
+        add_uniform_if_exists("Rp", 0.9 * Rp_m, 1.1 * Rp_m) or
+        add_uniform_if_exists("R_p", 0.9 * Rp_m, 1.1 * Rp_m) or
+        add_uniform_if_exists("planet_radius", 0.9 * Rp_m, 1.1 * Rp_m) or
+        add_uniform_if_exists("rp", 0.9 * Rp_m, 1.1 * Rp_m) or
+        add_uniform_if_exists("RpRs", 0.9 * float(base_cfg.rp_over_rs), 1.1 * float(base_cfg.rp_over_rs)) or
+        add_uniform_if_exists("rp_over_rs", 0.9 * float(base_cfg.rp_over_rs), 1.1 * float(base_cfg.rp_over_rs))
+    )
+    if not radius_set:
+        raise KeyError(
+            "Could not find a radius parameter in PLATON FitInfo. "
+            "Expected one of: Rp, R_p, planet_radius, rp, RpRs, rp_over_rs. "
+            f"Available: {available}"
+        )
+
+    # Temperature
+    if not add_uniform_if_exists("T", 0.5 * T, 1.5 * T):
+        # some versions might call it temperature
+        add_uniform_if_exists("temperature", 0.5 * T, 1.5 * T)
+
+    # Metallicity
+    add_uniform_if_exists("logZ", -1.0, 3.0)
+
+    # C/O ratio (sometimes named "C/O" or similar; start with what we passed)
+    if not add_uniform_if_exists("CO_ratio", 0.05, 2.0):
+        add_uniform_if_exists("C_O_ratio", 0.05, 2.0)
+
+    # Cloud top pressure prior
+    # We passed log_cloudtop_P into get_default_fit_info, but name might differ
+    cloud_done = (
+        add_gaussian_if_exists("log_cloudtop_P", mean=5.0, sigma=0.5) or
+        (add_uniform_if_exists("log_cloudtop_P", 0.0, 6.0)) or
+        add_gaussian_if_exists("log_cloudtop_pressure", mean=5.0, sigma=0.5) or
+        (add_uniform_if_exists("log_cloudtop_pressure", 0.0, 6.0))
+    )
+    if not cloud_done:
+        print("Warning: couldn't find a cloud-top pressure parameter in FitInfo; continuing without it.")
+
 
     # Cloudtop pressure prior (center at 1e5 Pa => log10=5)
     if hasattr(fit_info, "add_gaussian_fit_param"):
