@@ -3,7 +3,8 @@ from __future__ import annotations
 import h5py
 import numpy as np
 from typing import Dict, Optional, Any
-
+from pathlib import Path
+from typing import Tuple
 
 def load_prepared_lightcurve(h5_path: str) -> Dict[str, Any]:
     """
@@ -47,4 +48,34 @@ def load_transmission_spectrum_txt(path):
     data = np.loadtxt(path)
     wl, depth, elo, ehi = data.T
     return wl, depth, elo, ehi
+
+
+def load_binned_spectrum(path: str | Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load binned transmission spectrum.
+
+    Accepts:
+      - 4 cols: wavelength_um, depth, err_lo, err_hi
+      - 3 cols: wavelength_um, depth, err
+      - 2 cols: wavelength_um, depth (errors set to nan)
+
+    Returns:
+      wl_um, depth, err (1-sigma symmetric; for 4-col uses mean of lo/hi)
+    """
+    arr = np.loadtxt(path)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        raise ValueError(f"Unexpected spectrum format in {path}: shape={arr.shape}")
+
+    wl_um = arr[:, 0].astype(float)
+    depth = arr[:, 1].astype(float)
+
+    if arr.shape[1] >= 4:
+        err = 0.5 * (np.abs(arr[:, 2]) + np.abs(arr[:, 3])).astype(float)
+    elif arr.shape[1] == 3:
+        err = np.abs(arr[:, 2]).astype(float)
+    else:
+        err = np.full_like(depth, np.nan, dtype=float)
+
+    return wl_um, depth, err
+
 

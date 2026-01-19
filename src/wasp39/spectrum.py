@@ -5,7 +5,7 @@ from typing import Tuple, Optional
 
 from .binning import make_binned_lightcurve_for_wlbin, bin_time_series
 from .normalize import normalize_by_oot
-from .mcmc import fit_one_bin_mcmc
+from .mcmc import fit_white_light_mcmc
 from .lightcurve import TransitConfig
 
 
@@ -144,7 +144,7 @@ def construct_transmission_spectrum(
                   f"(pixels={n_pix}, points={len(t_use)})")
 
         # Run MCMC to fit Rp/R* for this bin
-        samples_rp, _ = fit_one_bin_mcmc(
+        samples_rp, _ = fit_white_light_mcmc(
             t_use, f_use, e_use, cfg,
             rp_init=rp_init,
             progress=progress,
