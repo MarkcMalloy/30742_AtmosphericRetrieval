@@ -9,7 +9,7 @@ def main():
         #"--steps", "0,1,2,3,4",
         #"--steps", "0,1,2,3",
         #"--steps", "0,1,2"
-        "--steps", "0,6"
+        "--steps", "0,1,7"
     ]
 
     from wasp39.main import main as pipeline_main

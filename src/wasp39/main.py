@@ -327,7 +327,182 @@ def Step6(ctx: dict, *, white_tag: str = "binned") -> None:
 
 
 def Step7(ctx: dict, *, tag: str = "binned") -> None:
-    print(f"STEP 7 — PLATON simple retrieval (emcee, tag={tag})")
+    """
+    STEP 7 — Atmospheric retrieval with PLATON (emcee)
+
+    Inputs:
+      - expects output/transmission_spectrum_<tag>.txt
+        with columns:
+          wl_center_um  depth  err_lo  err_hi
+
+    Outputs:
+      - 07_platon_retrieval_bestfit_<tag>.png
+      - 07_corner_platon_retrieval_<tag>.png
+      - 07_platon_retrieval_best_params_<tag>.txt
+    """
+    print(f"STEP 7 — PLATON retrieval (emcee, tag={tag})")
+
+    # Local imports keep earlier pipeline steps lightweight
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    from platon.constants import R_sun, M_jup  # <-- fixes your NameError (matches platon_model.py) :contentReference[oaicite:1]{index=1}
+    from platon.fit_info import FitInfo
+    from platon.combined_retriever import CombinedRetriever
+
+    out_dir = ctx["out"]
+    spec_path = os.path.join(out_dir, f"transmission_spectrum_{tag}.txt")
+    if not os.path.exists(spec_path):
+        raise RuntimeError(
+            f"Step7 needs a saved transmission spectrum, but couldn't find: {spec_path}. "
+            "Run Step5 first (with the same tag)."
+        )
+
+    # ------------------------------------------------------------------
+    # 1) Load spectrum (wl_um, depth, err_lo, err_hi)
+    # ------------------------------------------------------------------
+    wl_um, depth, elo, ehi = _load_transmission_spectrum_txt(spec_path)
+    wl_um = np.asarray(wl_um, dtype=float)
+    depth = np.asarray(depth, dtype=float)
+    elo = np.asarray(elo, dtype=float)
+    ehi = np.asarray(ehi, dtype=float)
+
+    # Symmetrize errors (simple)
+    err = 0.5 * (np.abs(elo) + np.abs(ehi))
+    err = np.where(np.isfinite(err) & (err > 0), err, np.nan)
+
+    if wl_um.ndim != 1 or wl_um.size < 2:
+        raise ValueError("Transmission spectrum must contain >=2 wavelength bins.")
+
+    # Build bin edges from centers (PLATON wants (N,2) in meters)
+    mids = 0.5 * (wl_um[1:] + wl_um[:-1])
+    left_edge0 = wl_um[0] - (mids[0] - wl_um[0])
+    right_edgeN = wl_um[-1] + (wl_um[-1] - mids[-1])
+    edges_um = np.concatenate([[left_edge0], mids, [right_edgeN]])
+    bins_m = np.column_stack([edges_um[:-1], edges_um[1:]]) * 1e-6  # um -> m
+
+    # Filter NaNs
+    mask = np.isfinite(depth) & np.isfinite(err) & np.isfinite(bins_m).all(axis=1)
+    bins_m = bins_m[mask]
+    depth = depth[mask]
+    err = err[mask]
+    if len(depth) < 2:
+        raise RuntimeError("After filtering NaNs, fewer than 2 wavelength bins remain for retrieval.")
+
+    # ------------------------------------------------------------------
+    # 2) Planet/star baseline params (initialized like platon_model)
+    # ------------------------------------------------------------------
+    base_cfg = ctx.get("platon_cfg", None)
+    if base_cfg is None:
+        # Fallback defaults
+        base_cfg = PlatonPlanetStar(
+            rp_over_rs=0.15,
+            rstar_rsun=0.895,
+            mplanet_mjup=0.281,
+            temperature_k=1150.0,
+            logZ=0.2,
+            CO_ratio=0.55,
+            cloudtop_pressure_pa=1e5,
+        )
+
+    Rs_m = float(base_cfg.rstar_rsun) * float(R_sun)
+    Rp_m = float(base_cfg.rp_over_rs) * Rs_m
+    Mp_kg = float(base_cfg.mplanet_mjup) * float(M_jup)
+    T = float(base_cfg.temperature_k)
+
+    retriever = CombinedRetriever()
+
+    fit_info: FitInfo = retriever.get_default_fit_info(
+        Mp=Mp_kg,
+        Rp=Rp_m,
+        T=T,
+        logZ=float(base_cfg.logZ),
+        CO_ratio=float(base_cfg.CO_ratio),
+        log_cloudtop_P=np.log10(float(getattr(base_cfg, "cloudtop_pressure_pa", 1e5))),
+        Rs=Rs_m,
+        T_star=float(getattr(base_cfg, "tstar_k", 5400.0)),
+    )
+
+    # Baseline fit params
+    fit_info.add_uniform_fit_param("R", 0.9 * Rp_m, 1.1 * Rp_m)
+    fit_info.add_uniform_fit_param("T", 0.5 * T, 1.5 * T)
+    fit_info.add_uniform_fit_param("logZ", -1.0, 3.0)
+    fit_info.add_uniform_fit_param("CO_ratio", 0.05, 2.0)
+
+    # Cloudtop pressure prior (center at 1e5 Pa => log10=5)
+    if hasattr(fit_info, "add_gaussian_fit_param"):
+        fit_info.add_gaussian_fit_param("log_cloudtop_P", mean=5.0, sigma=0.5)
+    else:
+        fit_info.add_uniform_fit_param("log_cloudtop_P", 0.0, 6.0)
+
+    # Optional: free gas VMRs if supported by your PLATON
+    if hasattr(fit_info, "add_gases_vmr"):
+        fit_info.add_gases_vmr(["H2O", "CO2", "CO", "CH4", "NH3", "H2-He"], 10 ** -12, 10 ** -2)
+
+    # ------------------------------------------------------------------
+    # 3) Run emcee
+    # ------------------------------------------------------------------
+    nwalkers = int(ctx.get("platon_nwalkers", 50))
+    nsteps = int(ctx.get("platon_nsteps", 10000))
+    print(f"Running PLATON emcee: nwalkers={nwalkers}, nsteps={nsteps}, nbins={len(depth)}")
+
+    result = retriever.run_emcee(
+        bins_m,
+        depth,
+        err,
+        fit_info,
+        nwalkers=nwalkers,
+        nsteps=nsteps,
+        include_condensation=True,
+        plot_best=True,
+    )
+
+    bestfit_png = os.path.join(out_dir, f"07_platon_retrieval_bestfit_{tag}.png")
+    plt.tight_layout()
+    plt.savefig(bestfit_png, dpi=200)
+    plt.close()
+    print(f"Saved best-fit overlay plot: {bestfit_png}")
+
+    # ------------------------------------------------------------------
+    # 4) Corner + best sample dump
+    # ------------------------------------------------------------------
+    chain = getattr(result, "flatchain", None)
+    lnprob = getattr(result, "flatlnprobability", None)
+
+    # emcee v3 fallback
+    if chain is None:
+        try:
+            chain = result.get_chain(flat=True)
+            lnprob = result.get_log_prob(flat=True)
+        except Exception:
+            chain = None
+
+    if chain is None:
+        print("Warning: couldn't extract flatchain from PLATON emcee result; skipping corner/summary.")
+        return
+
+    labels = None
+    for attr in ("fit_param_names", "fit_param_names_", "param_names", "labels"):
+        if hasattr(fit_info, attr):
+            labels = getattr(fit_info, attr)
+            break
+    if labels is None:
+        labels = [f"p{i}" for i in range(chain.shape[1])]
+
+    corner_png = os.path.join(out_dir, f"07_corner_platon_retrieval_{tag}.png")
+    save_corner(corner_png, chain, list(labels))
+    print(f"Saved corner plot: {corner_png}")
+
+    if lnprob is not None and len(lnprob) == len(chain):
+        i_best = int(np.nanargmax(lnprob))
+        p_best = chain[i_best]
+        summary_txt = os.path.join(out_dir, f"07_platon_retrieval_best_params_{tag}.txt")
+        with open(summary_txt, "w", encoding="utf-8") as f:
+            f.write("# PLATON retrieval best-fit (max posterior sample)\n")
+            for name, val in zip(labels, p_best):
+                f.write(f"{name}\t{val}\n")
+        print(f"Saved best-fit parameter dump: {summary_txt}")
 
 
 def _load_transmission_spectrum_txt(path: str):
