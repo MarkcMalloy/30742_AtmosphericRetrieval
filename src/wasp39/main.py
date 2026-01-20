@@ -354,6 +354,7 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
     if len(depth) < 2:
         raise RuntimeError("Not enough valid wavelength bins for retrieval")
 
+    # Build bin edges from centers
     mids = 0.5 * (wl_um[1:] + wl_um[:-1])
     edges = np.concatenate([
         [wl_um[0] - (mids[0] - wl_um[0])],
@@ -382,7 +383,7 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
     Rs = rstar_rsun * float(R_sun)
     Rp = rp_over_rs * Rs
     Mp = mplanet_mjup * float(M_jup)
-    log_cloudtop_P = float(np.log10(cloudtop_pressure_pa))
+    log_cloudtop_P0 = float(np.log10(cloudtop_pressure_pa))
 
     retriever = CombinedRetriever()
 
@@ -394,25 +395,71 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
         T=temperature_k,
         logZ=None,
         CO_ratio=None,
-        log_cloudtop_P=log_cloudtop_P,
+        log_cloudtop_P=log_cloudtop_P0,
         T_star=tstar_k,
         free_retrieval=True,
         fit_vmr=True,
     )
 
-    fit_info.add_uniform_fit_param("Rp", 0.9 * Rp, 1.1 * Rp)
-    fit_info.add_uniform_fit_param("T", 0.8 * temperature_k, 1.2 * temperature_k)
-    fit_info.add_uniform_fit_param("log_cloudtop_P", 0, 7.0)
+    # Core priors
+    fit_info.add_uniform_fit_param("Rp", 0.97 * Rp, 1.03 * Rp)
+    fit_info.add_uniform_fit_param("T", 0.92 * temperature_k, 1.07 * temperature_k)
+    fit_info.add_uniform_fit_param("log_cloudtop_P", 2.2, 5.0)
 
-    # VMR priors (these are linear VMR bounds in PLATON’s FitInfo helper)
-    fit_info.add_gases_vmr(["H2O", "CO2", "CO", "CH4"], 6e-5, 1e-3)
+    # ------------------------------------------------------------
+    # Gas priors — match the JWST WASP-39b PRISM graphic:
+    # H2O, CO2, CO, SO2
+    #
+    # IMPORTANT: This PLATON version will KeyError if we try to add a prior
+    # for a parameter name that doesn't already exist in fit_info.all_params.
+    # So we:
+    #   1) ask PLATON to include gases via add_gases_vmr
+    #   2) safely constrain whatever parameter names actually exist
+    # ------------------------------------------------------------
+
+    # 1) Ask PLATON to include these gases (some installs may ignore some species)
+    fit_info.add_gases_vmr(["H2O", "CO"], 1e-6, 1e-2)
+    fit_info.add_gases_vmr(["CO2"], 1e-8, 1e-3)
+    fit_info.add_gases_vmr(["SO2"], 1e-10, 1e-3)
+
+    # 2) Constrain only parameters that actually exist (prevents KeyError)
+    all_params = getattr(fit_info, "all_params", {})
+    existing_params = set(all_params.keys())
+    fit_names = set(getattr(fit_info, "fit_param_names", []) or [])
+
+    def _safe_uniform(name: str, lo: float, hi: float) -> None:
+        if (name in existing_params) and (name not in fit_names):
+            fit_info.add_uniform_fit_param(name, lo, hi)
+            fit_names.add(name)
+
+    # If PLATON exposes log_* params, constrain those; otherwise constrain linear names.
+    # H2O / CO
+    _safe_uniform("log_H2O", -6.0, -2.0)
+    _safe_uniform("log_CO",  -6.0, -2.0)
+    _safe_uniform("H2O", 1e-6, 1e-2)
+    _safe_uniform("CO",  1e-6, 1e-2)
+
+    # CO2
+    _safe_uniform("log_CO2", -8.0, -3.0)
+    _safe_uniform("CO2", 1e-8, 1e-3)
+
+    # SO2
+    _safe_uniform("log_SO2", -10.0, -3.0)
+    _safe_uniform("SO2", 1e-10, 1e-3)
+
+    try:
+        keys_preview = list(existing_params)
+        keys_preview.sort()
+        print("FitInfo all_params keys (preview):", keys_preview[:60])
+    except Exception:
+        pass
 
     print("PLATON fit parameters:")
     print("  " + ", ".join(fit_info.fit_param_names))
 
     nwalkers = int(ctx.get("platon_nwalkers", 50))
-    nsteps = int(ctx.get("platon_nsteps", 10000))
-    print(f"Running emcee: walkers={nwalkers}, steps={nsteps}, nbins={len(depth)}")
+    nsteps = int(ctx.get("platon_nsteps", 20))
+    print(f"Running emcee (single-core): walkers={nwalkers}, steps={nsteps}, nbins={len(depth)}")
 
     # Transmission-only: pass None so EclipseDepthCalculator is never created
     result = retriever.run_emcee(
@@ -431,8 +478,8 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
         print(f"Saved: {bestfit_png}")
     plt.close("all")
 
-    chain = result.get_chain(flat=True)
-    lnprob = result.get_log_prob(flat=True)
+    chain = np.asarray(result.flatchain)
+    lnprob = np.asarray(result.flatlnprobability)
 
     corner_png = os.path.join(out_dir, f"07_corner_platon_retrieval_{tag}.png")
     save_corner(corner_png, chain, fit_info.fit_param_names)
@@ -440,12 +487,7 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
 
     i_best = int(np.nanargmax(lnprob))
     p_best = chain[i_best]
-
-    summary_txt = os.path.join(out_dir, f"07_platon_retrieval_best_params_{tag}.txt")
-    with open(summary_txt, "w", encoding="utf-8") as f:
-        for name, val in zip(fit_info.fit_param_names, p_best):
-            f.write(f"{name}\t{val}\n")
-    print(f"Saved: {summary_txt}")
+    ctx[f"platon_bestfit_{tag}"] = dict(zip(fit_info.fit_param_names, map(float, p_best)))
 
 def _load_transmission_spectrum_txt(path: str):
     # File format: header line, then 4 columns:
