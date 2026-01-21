@@ -24,6 +24,61 @@ from typing import Dict, Optional, List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 
+def sanitize_abundance_overrides(
+    overrides: Dict[str, float],
+    *,
+    he_vmr: float = 0.06,
+    vmr_floor: float = 1e-12,
+    force_h2: bool = True,
+) -> Dict[str, float]:
+    """
+    Ensures:
+      - all VMRs are finite and >= vmr_floor
+      - total VMR <= 1 (leaves remainder to H2 by default)
+      - mixture is renormalized to sum to 1
+    """
+    clean = {}
+    for k, v in overrides.items():
+        if v is None:
+            continue
+        v = float(v)
+        if not np.isfinite(v) or v <= 0:
+            v = vmr_floor
+        clean[k] = max(v, vmr_floor)
+
+    # Enforce He if present/desired
+    clean["He"] = max(float(clean.get("He", he_vmr)), vmr_floor)
+
+    # Compute remainder for H2
+    total = sum(clean.values())
+    if force_h2:
+        # Ensure we have an H2 remainder
+        rem = 1.0 - total
+        if rem < vmr_floor:
+            # If the user-specified gases overfill the atmosphere,
+            # scale *everything except He* down to make room for H2.
+            # Keep He fixed.
+            he = clean["He"]
+            others = {k: v for k, v in clean.items() if k != "He"}
+            others_sum = sum(others.values())
+
+            target_others_sum = max(1.0 - he - vmr_floor, vmr_floor)
+            if others_sum > 0:
+                scale = target_others_sum / others_sum
+                for k in others:
+                    clean[k] = max(others[k] * scale, vmr_floor)
+
+            clean["He"] = he
+            clean["H2"] = vmr_floor
+        else:
+            clean["H2"] = max(clean.get("H2", 0.0) + rem, vmr_floor)
+
+    # Final renormalization to sum=1 (important!)
+    total = sum(clean.values())
+    for k in list(clean.keys()):
+        clean[k] = clean[k] / total
+
+    return clean
 
 # -----------------------------
 # Model specs
@@ -72,11 +127,14 @@ def compute_case(
     cfg_kwargs.update(case.cfg_overrides)
 
     cfg = PlatonPlanetStar(**cfg_kwargs)
+    abund = case.abundance_overrides_vmr
+    if abund is not None:
+        abund = sanitize_abundance_overrides(abund, he_vmr=0.06, vmr_floor=1e-12, force_h2=True)
 
     _, depth_model = compute_platon_transit_depths(
         cfg=cfg,
         wavelengths_um=wl_um,
-        abundance_overrides_vmr=case.abundance_overrides_vmr,
+        abundance_overrides_vmr=abund,
         zero_opacities=case.zero_opacities,
         out_txt=None,
         out_npz=None,
@@ -155,6 +213,19 @@ def main() -> None:
 
     # Debug
     ap.add_argument("--list-opacities", action="store_true")
+
+    ap.add_argument(
+        "--drop-high-err",
+        action="store_true",
+        help="Drop wavelength points with err > 3×median(err).",
+    )
+    ap.add_argument(
+        "--high-err-sigma",
+        type=float,
+        default=3.0,
+        help="Threshold multiplier: drop if err > (this)×median(err). Used with --drop-high-err.",
+    )
+
     args = ap.parse_args()
 
     spec_path = Path(args.spec)
@@ -185,6 +256,27 @@ def main() -> None:
     depth_obs = np.asarray(depth_obs, float)
     err_obs = np.asarray(err_obs, float)
 
+    # -----------------------------
+    # Drop high-uncertainty points (ALWAYS)
+    # -----------------------------
+    finite = np.isfinite(wl_um) & np.isfinite(depth_obs) & np.isfinite(err_obs) & (err_obs > 0)
+    if not np.any(finite):
+        raise SystemExit("No finite data points found after basic finite filtering.")
+
+    med_err = float(np.nanmedian(err_obs[finite]))
+    if not np.isfinite(med_err) or med_err <= 0:
+        raise SystemExit(f"Median error is not valid: {med_err}")
+
+    thresh = float(args.high_err_sigma) * med_err  # you can keep the CLI arg for tuning
+    keep = finite & (err_obs <= thresh)
+
+    dropped = int(np.sum(finite) - np.sum(keep))
+    print(f"[Data] Dropped {dropped} high-uncertainty point(s) (err > {args.high_err_sigma}×median = {thresh:.3g}).")
+
+    wl_um = wl_um[keep]
+    depth_obs = depth_obs[keep]
+    err_obs = err_obs[keep]
+
     global_zero = _parse_zero_opacities(args.global_zero_opacities)
 
     # Base cfg shared by all models
@@ -207,12 +299,29 @@ def main() -> None:
     # Family A: composition-defined (explicit abundances)
     # These are just examples; tune to match your paper’s intent.
     elemental_cases: List[ModelCase] = [
+        # 4) Plausible hot-Jupiter: CO rich, very low CH4 (high-T chemistry)
+
+        ModelCase(
+            name="Hot Jupiter: CO moderate, CH4 suppressed",
+            cfg_overrides={},
+            abundance_overrides_vmr={
+                "He": 0.06,
+                "H2O": 1e-5,
+                "CO": 5e-8,  # was 5e-4
+                "CO2": 1e-7,
+                "CH4": 1e-10,
+            },
+            baseline_match=True,
+        ),
+
+    ]
+
+    elemental_cases2: List[ModelCase] = [
+        # 1) Keep ONE "100% composition" diagnostic curve (as you requested)
         ModelCase(
             name="100% H2O-like",
-            cfg_overrides={},  # use base_cfg geometry + T + clouds
+            cfg_overrides={},
             abundance_overrides_vmr={
-                # Keep some background; PLATON expects a physically sensible mix.
-                # You can push toward a single-species signature by dominating the active absorber.
                 "He": 0.06,
                 "H2O": 1e-3,
                 "CO2": 1e-12,
@@ -222,45 +331,49 @@ def main() -> None:
             zero_opacities=None,
             baseline_match=True,
         ),
+
+        # 2) Plausible hot-Jupiter: H2/He dominated with moderate water, low CO2
         ModelCase(
-            name="100% CO2-like",
+            name="Hot Jupiter: H2O moderate, CO2 low",
             cfg_overrides={},
             abundance_overrides_vmr={
                 "He": 0.06,
-                "H2O": 1e-12,
-                "CO2": 1e-3,
-                "CO": 1e-12,
-                "CH4": 1e-12,
+                "H2O": 3e-4,  # water at a few 1e-4
+                "CO": 1e-4,  # CO present
+                "CO2": 3e-8,  # low CO2 (keeps 4.3 µm from exploding)
+                "CH4": 1e-9,  # hot => CH4 usually tiny
             },
             baseline_match=True,
         ),
+
+        # 3) Plausible hot-Jupiter: CO2 enhanced (but still trace) to test 4.3 µm
         ModelCase(
-            name="100% CH4-like",
+            name="Hot Jupiter: CO2 enhanced (suppressed)",
             cfg_overrides={},
             abundance_overrides_vmr={
                 "He": 0.06,
-                "H2O": 1e-12,
-                "CO2": 1e-12,
-                "CO": 1e-12,
-                "CH4": 1e-3,
+                "H2O": 2e-4,
+                "CO": 2e-6,
+                "CO2": 3e-8,  # was 3e-6
+                "CH4": 1e-9,
             },
             baseline_match=True,
         ),
+
+        # 4) Plausible hot-Jupiter: CO rich, very low CH4 (high-T chemistry)
         ModelCase(
-            name="N2+CH4 mix (example)",
+            name="Hot Jupiter: CO moderate, CH4 suppressed",
             cfg_overrides={},
             abundance_overrides_vmr={
                 "He": 0.06,
-                "CH4": 4e-4,
-                # N2 handling depends on PLATON species availability;
-                # If "N2" exists in your install, use it; otherwise remove this line.
-                "N2": 9.6e-3,
-                "H2O": 1e-12,
-                "CO2": 1e-12,
-                "CO": 1e-12,
+                "H2O": 1e-4,
+                "CO": 5e-7,  # was 5e-4
+                "CO2": 5e-8,
+                "CH4": 1e-10,
             },
             baseline_match=True,
         ),
+
     ]
 
     # Family B: metallicity-defined (like 1x solar vs 100x solar)
@@ -314,7 +427,7 @@ def main() -> None:
             results.append((case, depth_plot, offset))
 
             # Save model
-            out_txt = out_dir / f"platon_model_{family_key}_{_slug(case.name)}.txt"
+            out_txt = out_dir / f"final/platon_model_{family_key}_{_slug(case.name)}.txt"
             np.savetxt(
                 out_txt,
                 np.c_[wl_um, depth_plot],
@@ -334,8 +447,8 @@ def main() -> None:
         depth_obs=depth_obs,
         err_obs=err_obs,
         cases_results=elemental_results,
-        out_png=out_dir / "platon_overlay_elemental.png",
-        no_errorbars=args.no_errorbars,
+        out_png=out_dir / "final/platon_overlay_elemental.png",
+        no_errorbars=False,
     )
     plot_family(
         family_name="Metallicity-defined",
@@ -344,7 +457,7 @@ def main() -> None:
         depth_obs=depth_obs,
         err_obs=err_obs,
         cases_results=metallicity_results,
-        out_png=out_dir / "platon_overlay_metallicity.png",
+        out_png=out_dir / "final/platon_overlay_metallicity.png",
         no_errorbars=args.no_errorbars,
     )
 

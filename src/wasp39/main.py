@@ -508,7 +508,7 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
     if not np.isfinite(med) or med <= 0:
         raise RuntimeError("Median uncertainty is non-finite or non-positive; check spectrum errors.")
 
-    keep = err < 3.0 * med
+    keep = err <= 1.0 * med
     dropped = int(np.count_nonzero(~keep))
     wl_um, depth, err = wl_um[keep], depth[keep], err[keep]
     if dropped > 0:
@@ -818,6 +818,18 @@ def main() -> None:
     ap.add_argument("--binning-factor", type=int, default=5)
     ap.add_argument("--n-wavelength-bins", type=int, default=75)
     ap.add_argument("--spec-time-bin-factor", type=int, default=10)
+    ap.add_argument(
+        "--drop-high-err",
+        action="store_true",
+        help="Drop wavelength points with err > 3×median(err).",
+    )
+    ap.add_argument(
+        "--high-err-sigma",
+        type=float,
+        default=3.0,
+        help="Threshold multiplier: drop if err > (this)×median(err). Used with --drop-high-err.",
+    )
+
     args = ap.parse_args()
 
 
