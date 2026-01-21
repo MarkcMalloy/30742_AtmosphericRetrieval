@@ -1,0 +1,13 @@
+Fit mode: 3param
+ncores used: 15
+Best-fit retrieved parameters (median):
+             T_K:  1491.56  (16-84:  1322.27,  1695.24)
+            logZ: -0.322456  (16-84: -0.97019,  0.827005)
+        CO_ratio:  0.979605  (16-84:  0.830094,  1.17064)
+     delta_depth: -0.00271151  (16-84: -0.00323854, -0.000854063)
+   log_err_scale:  1.33096  (16-84: -0.12998,  1.65376)
+
+Fixed log10Pcloud_Pa (if applicable): 8
+
+Atmosphere params passed to PLATON wrapper:
+{'logZ': -0.32245623338108353, 'CO_ratio': 0.9796046915265841, 'CH4_mult': 1.0, 'add_gas_absorption': True, 'add_H_minus_absorption': False, 'add_scattering': True, 'add_collisional_absorption': True, 'cloudtop_pressure': 100000000.0, 'scattering_factor': 1.0, 'scattering_slope': 4.0, 'scattering_ref_wavelength': 1e-06, 'custom_abundances': None, 'gases': None, 'vmrs': None}

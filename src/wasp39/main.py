@@ -18,7 +18,7 @@ from .plotting import (
     save_transmission_spectrum_plot,
 )
 #from .spectrum import construct_transmission_spectrum
-from .spectrum_multicore import construct_transmission_spectrum
+from .spectrum import construct_transmission_spectrum
 from .platon_model import compute_platon_transit_depths, PlatonPlanetStar, platon_overlay_binned, platon_list_opacity_names
 
 def parse_steps(s: str) -> list[int]:
@@ -238,9 +238,14 @@ def Step4(ctx: dict) -> None:
 
 
 def Step5(ctx: dict, *, n_wl_bins: int, spec_time_bin: int, white_tag: str = "unbinned") -> None:
-    print(f"STEP 5 — Build transmission spectrum (tag={white_tag})")
+    print(f"STEP 5 — Build transmission spectrum (common-mode corrected, tag={white_tag})")
 
-    # Load Step4 best-fit if missing OR if we're switching to a different tag
+    import os
+    import numpy as np
+
+    # ----------------------------
+    # 0) Load white-light best fit
+    # ----------------------------
     if ("cfg" not in ctx) or ("rp_fit" not in ctx) or (ctx.get("_white_tag") != white_tag):
         npz_path = os.path.join(ctx["out"], f"white_light_bestfit_{white_tag}.npz")
         if not os.path.exists(npz_path):
@@ -265,27 +270,126 @@ def Step5(ctx: dict, *, n_wl_bins: int, spec_time_bin: int, white_tag: str = "un
         ctx["_white_tag"] = white_tag
         print(f"Loaded white-light best-fit ({white_tag}) from: {npz_path}")
 
-    # ✅ ALWAYS build + save the spectrum
     out_txt = os.path.join(ctx["out"], f"transmission_spectrum_{white_tag}.txt")
     out_png = os.path.join(ctx["out"], f"transmission_spectrum_{white_tag}.png")
 
+    # Time binning factor
+    time_bin_factor = int(spec_time_bin) if (spec_time_bin is not None) else int(ctx.get("binning_factor", 1))
+    if time_bin_factor < 1:
+        time_bin_factor = 1
+
+    # ----------------------------
+    # 1) Build common-mode series
+    # ----------------------------
+    bjd = np.asarray(ctx["bjd"])
+    wl = np.asarray(ctx["wavelength"])
+    flux_2d = np.asarray(ctx["flux"])
+    fluxerr_2d = np.asarray(ctx["flux_err"])
+    oot = np.asarray(ctx["oot_idx"], dtype=bool)
+
+    if flux_2d.ndim != 2:
+        raise RuntimeError(f"Expected flux_2d to be 2D (ntime, nwave); got shape {flux_2d.shape}")
+    if flux_2d.shape != fluxerr_2d.shape:
+        raise RuntimeError("flux_2d and fluxerr_2d must have the same shape")
+
+    ntime, nwave = flux_2d.shape
+    if wl.shape[0] != nwave:
+        # If your data is transposed, fix it here
+        if wl.shape[0] == ntime and flux_2d.shape[1] != ntime:
+            raise RuntimeError("wavelength length matches ntime unexpectedly; please check array shapes.")
+        raise RuntimeError(f"wavelength_um length ({wl.shape[0]}) must match flux_2d second dim ({nwave})")
+
+    # Weighted white flux (reduces white noise; robust to bad channels)
+    w = 1.0 / np.maximum(fluxerr_2d, 1e-12) ** 2
+    wsum = np.sum(w, axis=1)
+    white_flux = np.sum(w * flux_2d, axis=1) / np.maximum(wsum, 1e-30)
+
+    # Normalize white flux using out-of-transit
+    if np.any(oot):
+        white_norm = np.nanmedian(white_flux[oot])
+    else:
+        white_norm = np.nanmedian(white_flux)
+    white_flux_n = white_flux / white_norm
+
+    # Try to compute a transit model for the white curve (preferred)
+    white_model = None
+    try:
+        # Adjust this import/name if your batman wrapper lives elsewhere
+        from wasp39.transit import batman_model  # noqa
+        # Typical signature in your project is batman_model(t, cfg, rp)
+        white_model = batman_model(bjd, ctx["cfg"], float(ctx["rp_fit"]))
+    except Exception:
+        white_model = None
+
+    if white_model is None:
+        # Fallback: smooth the white flux itself to get a common-mode trend
+        # (still useful for removing drifts; not as clean as transit-model residuals)
+        try:
+            from scipy.signal import savgol_filter
+            # window length must be odd and < ntime
+            win = min(101, ntime - (1 - ntime % 2))
+            if win < 11:
+                win = max(5, ntime - (1 - ntime % 2))
+            if win % 2 == 0:
+                win += 1
+            white_trend = savgol_filter(white_flux_n, window_length=win, polyorder=2, mode="interp")
+        except Exception:
+            # last-resort: median filter-ish smoothing
+            k = min(21, ntime)
+            if k % 2 == 0:
+                k += 1
+            pad = k // 2
+            x = np.pad(white_flux_n, (pad, pad), mode="edge")
+            white_trend = np.array([np.median(x[i:i + k]) for i in range(ntime)], float)
+
+        common_mode = np.clip(white_flux_n / np.maximum(white_trend, 1e-30), 0.2, 5.0)
+        print("[Step5] Common-mode: using smoothed white flux fallback (no transit model available).")
+    else:
+        # Residual common-mode = data/model (captures achromatic systematics)
+        white_model = np.asarray(white_model, float)
+        # Ensure white_model is normalized similarly (OOT ~ 1)
+        if np.any(oot):
+            mnorm = np.nanmedian(white_model[oot])
+        else:
+            mnorm = np.nanmedian(white_model)
+        white_model_n = white_model / np.maximum(mnorm, 1e-30)
+
+        common_mode = np.clip(white_flux_n / np.maximum(white_model_n, 1e-30), 0.2, 5.0)
+        print("[Step5] Common-mode: using (white flux)/(white transit model) residuals.")
+
+    # Apply correction to all channels
+    flux_corr = flux_2d / common_mode[:, None]
+    fluxerr_corr = fluxerr_2d / common_mode[:, None]  # approx propagation
+
+    # Optional: light clipping of extreme corrected points (helps hot pixels/cosmic rays)
+    # (Keep it conservative; channel fits should handle robustly too.)
+    if ctx.get("spec_sigma_clip", False):
+        med = np.nanmedian(flux_corr, axis=0, keepdims=True)
+        mad = np.nanmedian(np.abs(flux_corr - med), axis=0, keepdims=True)
+        sig = 1.4826 * mad + 1e-12
+        bad = np.abs(flux_corr - med) > (5.0 * sig)
+        flux_corr = np.where(bad, np.nan, flux_corr)
+        fluxerr_corr = np.where(bad, np.nan, fluxerr_corr)
+
+    # ----------------------------
+    # 2) Build transmission spectrum
+    # ----------------------------
     wl_c, depth, elo, ehi = construct_transmission_spectrum(
-        bjd=ctx["bjd"],
-        wavelength_um=ctx["wavelength"],
-        flux_2d=ctx["flux"],
-        fluxerr_2d=ctx["flux_err"],
+        bjd=bjd,
+        wavelength_um=wl,
+        flux_2d=flux_corr,
+        fluxerr_2d=fluxerr_corr,
         cfg=ctx["cfg"],
-        n_wavelength_bins=n_wl_bins,
-        oot_index=ctx["oot_idx"],
-        rp_init=ctx["rp_fit"],
+        n_wavelength_bins=int(n_wl_bins),
+        oot_index=oot,
+        rp_init=float(ctx["rp_fit"]),
         progress=True,
         verbose=True,
-        time_bin_factor=spec_time_bin,
-        n_jobs=15
+        time_bin_factor=time_bin_factor,
     )
 
     save_transmission_spectrum_txt(out_txt, wl_c, depth, elo, ehi)
-    save_transmission_spectrum_plot(out_png, wl_c, depth, elo, ehi, f"Transmission Spectrum ({white_tag})")
+    save_transmission_spectrum_plot(out_png, wl_c, depth, elo, ehi, f"Transmission Spectrum ({white_tag}, common-mode)")
     print(f"Saved: {out_txt}")
     print(f"Saved: {out_png}")
 
@@ -325,16 +429,52 @@ def Step6(ctx: dict, *, white_tag: str = "binned") -> None:
     print("PLATON transit depth spectrum + plot saved.")
 
 
-
 def Step7(ctx: dict, *, tag: str = "binned") -> None:
-    print(f"STEP 7 — PLATON retrieval (emcee, tag={tag})")
+    print(f"STEP 7 — PLATON equilibrium retrieval (WASP-39b priors, emcee, tag={tag})")
 
     import os
     import numpy as np
     import matplotlib.pyplot as plt
+    import warnings
 
     from platon.constants import R_sun, M_jup
     from platon.combined_retriever import CombinedRetriever
+
+    try:
+        from tqdm import tqdm
+    except Exception:
+        tqdm = None
+
+    def _set_fitinfo_key(fit_info, key: str, value) -> bool:
+        """
+        Best-effort setter for different PLATON FitInfo versions.
+        Returns True if we found a dict-like storage and set the key.
+        """
+        for attr in ("default_params", "params", "fit_param_defaults", "_param_defaults"):
+            d = getattr(fit_info, attr, None)
+            if isinstance(d, dict):
+                d[key] = value
+                return True
+        # Also try attribute set (some versions expose as attributes)
+        if hasattr(fit_info, key):
+            try:
+                setattr(fit_info, key, value)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _get_fitinfo_key(fit_info, key: str):
+        for attr in ("default_params", "params", "fit_param_defaults", "_param_defaults"):
+            d = getattr(fit_info, attr, None)
+            if isinstance(d, dict) and key in d:
+                return d[key]
+        if hasattr(fit_info, key):
+            try:
+                return getattr(fit_info, key)
+            except Exception:
+                return None
+        return None
 
     out_dir = ctx["out"]
     spec_path = os.path.join(out_dir, f"transmission_spectrum_{tag}.txt")
@@ -342,28 +482,74 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
         raise RuntimeError(f"Missing spectrum: {spec_path}")
 
     wl_um, depth, elo, ehi = _load_transmission_spectrum_txt(spec_path)
-
     wl_um = np.asarray(wl_um, float)
     depth = np.asarray(depth, float)
     elo = np.asarray(elo, float)
     ehi = np.asarray(ehi, float)
 
+    # Symmetrized errors
     err = 0.5 * (np.abs(elo) + np.abs(ehi))
-    mask = np.isfinite(wl_um) & np.isfinite(depth) & np.isfinite(err) & (err > 0)
-    wl_um, depth, err = wl_um[mask], depth[mask], err[mask]
-    if len(depth) < 2:
-        raise RuntimeError("Not enough valid wavelength bins for retrieval")
 
-    # Build bin edges from centers
+    # ----------------------------
+    # A) Robust data hygiene
+    # ----------------------------
+    n_in = len(wl_um)
+
+    base = np.isfinite(wl_um) & np.isfinite(depth) & np.isfinite(err) & (err > 0)
+    wl_um, depth, err = wl_um[base], depth[base], err[base]
+
+    phys = (depth > 0.0) & (depth < 0.1)
+    wl_um, depth, err = wl_um[phys], depth[phys], err[phys]
+
+    if len(depth) < 3:
+        raise RuntimeError("Not enough valid wavelength bins for retrieval after filtering")
+
+    med = float(np.nanmedian(err))
+    if not np.isfinite(med) or med <= 0:
+        raise RuntimeError("Median uncertainty is non-finite or non-positive; check spectrum errors.")
+
+    keep = err < 3.0 * med
+    dropped = int(np.count_nonzero(~keep))
+    wl_um, depth, err = wl_um[keep], depth[keep], err[keep]
+    if dropped > 0:
+        print(f"[Step7] Dropped {dropped} high-uncertainty bin(s) (>{3.0:.1f}× median err).")
+
+    if len(depth) < 3:
+        raise RuntimeError("Not enough valid wavelength bins after outlier rejection")
+
+    srt = np.argsort(wl_um)
+    wl_um, depth, err = wl_um[srt], depth[srt], err[srt]
+
+    # ----------------------------
+    # B) Error floor (stability)
+    # ----------------------------
+    err_floor = float(ctx.get("platon_err_floor", 0.0))
+    if err_floor <= 0:
+        err_floor = 0.01 * float(np.nanmedian(err))
+    err_floor = max(err_floor, 1e-5)
+    err = np.maximum(err, err_floor)
+
+    # ----------------------------
+    # C) Build bin edges (meters)
+    # ----------------------------
     mids = 0.5 * (wl_um[1:] + wl_um[:-1])
     edges = np.concatenate([
         [wl_um[0] - (mids[0] - wl_um[0])],
         mids,
         [wl_um[-1] + (wl_um[-1] - mids[-1])]
     ])
-    bins_m = np.column_stack([edges[:-1], edges[1:]]) * 1e-6
+    if not np.all(np.diff(edges) > 0):
+        d = np.diff(wl_um)
+        edges = np.concatenate([[wl_um[0] - d[0] / 2], 0.5 * (wl_um[1:] + wl_um[:-1]), [wl_um[-1] + d[-1] / 2]])
 
-    base = ctx.get("platon_cfg", None)
+    bins_m = np.column_stack([edges[:-1], edges[1:]]) * 1e-6
+    if not np.all(bins_m[:, 1] > bins_m[:, 0]):
+        raise RuntimeError("Non-positive bin widths encountered; check wavelength centers input.")
+
+    # ----------------------------
+    # D) Planet/star config
+    # ----------------------------
+    base_cfg = ctx.get("platon_cfg", None)
 
     rstar_rsun = 0.895
     rp_over_rs = 0.15
@@ -372,122 +558,246 @@ def Step7(ctx: dict, *, tag: str = "binned") -> None:
     cloudtop_pressure_pa = 1e5
     tstar_k = 5400.0
 
-    if base is not None:
-        rstar_rsun = float(getattr(base, "rstar_rsun", rstar_rsun))
-        rp_over_rs = float(getattr(base, "rp_over_rs", rp_over_rs))
-        mplanet_mjup = float(getattr(base, "mplanet_mjup", mplanet_mjup))
-        temperature_k = float(getattr(base, "temperature_k", temperature_k))
-        cloudtop_pressure_pa = float(getattr(base, "cloudtop_pressure_pa", cloudtop_pressure_pa))
-        tstar_k = float(getattr(base, "tstar_k", tstar_k))
+    if base_cfg is not None:
+        rstar_rsun = float(getattr(base_cfg, "rstar_rsun", rstar_rsun))
+        rp_over_rs = float(getattr(base_cfg, "rp_over_rs", rp_over_rs))
+        mplanet_mjup = float(getattr(base_cfg, "mplanet_mjup", mplanet_mjup))
+        temperature_k = float(getattr(base_cfg, "temperature_k", temperature_k))
+        cloudtop_pressure_pa = float(getattr(base_cfg, "cloudtop_pressure_pa", cloudtop_pressure_pa))
+        tstar_k = float(getattr(base_cfg, "tstar_k", tstar_k))
 
     Rs = rstar_rsun * float(R_sun)
-    Rp = rp_over_rs * Rs
+    Rp0 = rp_over_rs * Rs
     Mp = mplanet_mjup * float(M_jup)
     log_cloudtop_P0 = float(np.log10(cloudtop_pressure_pa))
 
+    # ----------------------------
+    # E) Priors (WASP-39b-ish)
+    # ----------------------------
+    T_lo, T_hi = 950.0, 1250.0
+
+    logZ_lo, logZ_hi = -0.5, 3.0
+    logZ0 = float(ctx.get("platon_logZ0", 1.0))
+
+    CO_lo, CO_hi = 0.05, 0.60
+    CO_ratio0 = float(ctx.get("platon_CO_ratio0", 0.3))
+
+    logPc_lo, logPc_hi = 3.3, 5.3
+    Rp_frac = 0.022
+
+    # haze / scattering
+    log_scatt_lo, log_scatt_hi = -6.0, 1.0
+    scatt_slope_lo, scatt_slope_hi = -8.0, 0.0
+
+    # error inflation
+    err_mult_lo, err_mult_hi = 0.5, 30.0
+
+    # Initial values (validated BEFORE sampling)
+    log_scatt0 = float(ctx.get("platon_log_scatt0", -3.0))
+    scatt_slope0 = float(ctx.get("platon_scatt_slope0", -4.0))
+    err_mult0 = float(ctx.get("platon_err_mult0", 10.0))
+
+    log_scatt0 = float(np.clip(log_scatt0, log_scatt_lo + 1e-6, log_scatt_hi - 1e-6))
+    scatt_slope0 = float(np.clip(scatt_slope0, scatt_slope_lo + 1e-6, scatt_slope_hi - 1e-6))
+    err_mult0 = float(np.clip(err_mult0, err_mult_lo + 1e-6, err_mult_hi - 1e-6))
+
+    nwalkers = int(ctx.get("platon_nwalkers", 80))
+    nsteps = int(ctx.get("platon_nsteps", 2000))
+    burn_frac = float(ctx.get("platon_burn_frac", 0.3))
+    include_condensation = bool(ctx.get("platon_include_condensation", True))
+
     retriever = CombinedRetriever()
 
-    # CRITICAL: for free retrieval / VMR fitting, PLATON requires logZ=None and CO_ratio=None
     fit_info = retriever.get_default_fit_info(
         Rs=Rs,
         Mp=Mp,
-        Rp=Rp,
+        Rp=Rp0,
         T=temperature_k,
-        logZ=None,
-        CO_ratio=None,
+        logZ=logZ0,
+        CO_ratio=CO_ratio0,
         log_cloudtop_P=log_cloudtop_P0,
         T_star=tstar_k,
-        free_retrieval=True,
-        fit_vmr=True,
+        free_retrieval=False,
+        fit_vmr=False,
     )
 
-    # Core priors
-    fit_info.add_uniform_fit_param("Rp", 0.97 * Rp, 1.03 * Rp)
-    fit_info.add_uniform_fit_param("T", 0.92 * temperature_k, 1.07 * temperature_k)
-    fit_info.add_uniform_fit_param("log_cloudtop_P", 2.2, 5.0)
+    # ---- Force power-law scattering if possible (prevents Mie restriction) ----
+    # Some PLATON versions support 'profile_type' to select scattering model.
+    desired_profile = str(ctx.get("platon_profile_type", "power_law"))
+    _set_fitinfo_key(fit_info, "profile_type", desired_profile)
 
-    # ------------------------------------------------------------
-    # Gas priors — match the JWST WASP-39b PRISM graphic:
-    # H2O, CO2, CO, SO2
-    #
-    # IMPORTANT: This PLATON version will KeyError if we try to add a prior
-    # for a parameter name that doesn't already exist in fit_info.all_params.
-    # So we:
-    #   1) ask PLATON to include gases via add_gases_vmr
-    #   2) safely constrain whatever parameter names actually exist
-    # ------------------------------------------------------------
+    # Always set safe initial defaults inside bounds
+    _set_fitinfo_key(fit_info, "scatt_slope", scatt_slope0)
+    _set_fitinfo_key(fit_info, "error_multiple", err_mult0)
 
-    # 1) Ask PLATON to include these gases (some installs may ignore some species)
-    fit_info.add_gases_vmr(["H2O", "CO"], 1e-6, 1e-2)
-    fit_info.add_gases_vmr(["CO2"], 1e-8, 1e-3)
-    fit_info.add_gases_vmr(["SO2"], 1e-10, 1e-3)
+    # If we are in Mie mode, PLATON requires log_scatt_factor == 0.
+    # We don't know for sure which mode your PLATON version is in, so we:
+    #  - attempt power-law (above)
+    #  - then enforce log_scatt_factor=0 if validation would otherwise fail
+    log_scatt0_eff = 0.0
+    profile_now = _get_fitinfo_key(fit_info, "profile_type")
+    is_mie = isinstance(profile_now, str) and ("mie" in profile_now.lower())
 
-    # 2) Constrain only parameters that actually exist (prevents KeyError)
-    all_params = getattr(fit_info, "all_params", {})
-    existing_params = set(all_params.keys())
-    fit_names = set(getattr(fit_info, "fit_param_names", []) or [])
+    if is_mie:
+        log_scatt0_eff = 0.0
+        log_scatt_fit = False
+        print("[Step7] Detected Mie scattering profile_type; fixing log_scatt_factor=0 (PLATON requirement).")
+    else:
+        log_scatt0_eff = log_scatt0
+        log_scatt_fit = True
 
-    def _safe_uniform(name: str, lo: float, hi: float) -> None:
-        if (name in existing_params) and (name not in fit_names):
-            fit_info.add_uniform_fit_param(name, lo, hi)
-            fit_names.add(name)
+    _set_fitinfo_key(fit_info, "log_scatt_factor", float(log_scatt0_eff))
 
-    # If PLATON exposes log_* params, constrain those; otherwise constrain linear names.
-    # H2O / CO
-    _safe_uniform("log_H2O", -6.0, -2.0)
-    _safe_uniform("log_CO",  -6.0, -2.0)
-    _safe_uniform("H2O", 1e-6, 1e-2)
-    _safe_uniform("CO",  1e-6, 1e-2)
+    # Fit params + priors
+    fit_info.add_uniform_fit_param("Rp", (1.0 - Rp_frac) * Rp0, (1.0 + Rp_frac) * Rp0)
+    fit_info.add_uniform_fit_param("T", T_lo, T_hi)
+    fit_info.add_uniform_fit_param("log_cloudtop_P", logPc_lo, logPc_hi)
+    fit_info.add_uniform_fit_param("logZ", logZ_lo, logZ_hi)
+    fit_info.add_uniform_fit_param("CO_ratio", CO_lo, CO_hi)
 
-    # CO2
-    _safe_uniform("log_CO2", -8.0, -3.0)
-    _safe_uniform("CO2", 1e-8, 1e-3)
+    # Scattering params:
+    # - if Mie, we MUST NOT fit log_scatt_factor (it must be exactly 0)
+    if log_scatt_fit:
+        fit_info.add_uniform_fit_param("log_scatt_factor", log_scatt_lo, log_scatt_hi)
+    # scatt_slope: keep fitting (if your PLATON version rejects this in Mie too, set scatt_slope_lo/hi to a single value)
+    fit_info.add_uniform_fit_param("scatt_slope", scatt_slope_lo, scatt_slope_hi)
 
-    # SO2
-    _safe_uniform("log_SO2", -10.0, -3.0)
-    _safe_uniform("SO2", 1e-10, 1e-3)
-
-    try:
-        keys_preview = list(existing_params)
-        keys_preview.sort()
-        print("FitInfo all_params keys (preview):", keys_preview[:60])
-    except Exception:
-        pass
+    # Error multiple
+    fit_info.add_uniform_fit_param("error_multiple", err_mult_lo, err_mult_hi)
 
     print("PLATON fit parameters:")
     print("  " + ", ".join(fit_info.fit_param_names))
 
-    nwalkers = int(ctx.get("platon_nwalkers", 50))
-    nsteps = int(ctx.get("platon_nsteps", 20))
-    print(f"Running emcee (single-core): walkers={nwalkers}, steps={nsteps}, nbins={len(depth)}")
+    ndim = len(fit_info.fit_param_names)
+    if nwalkers < 2 * ndim:
+        nwalkers = 2 * ndim
+        print(f"[Step7] Increased nwalkers to {nwalkers} (need >= 2*ndim, ndim={ndim})")
 
-    # Transmission-only: pass None so EclipseDepthCalculator is never created
-    result = retriever.run_emcee(
-        bins_m, depth, err,
-        None, None, None,
-        fit_info,
-        nwalkers=nwalkers,
-        nsteps=nsteps,
-        include_condensation=True,
+    print(f"Running emcee: walkers={nwalkers}, steps={nsteps}, nbins={len(depth)}")
+    print(
+        f"  Priors: T=[{T_lo},{T_hi}] K, logZ=[{logZ_lo},{logZ_hi}], CO=[{CO_lo},{CO_hi}], "
+        f"logPc=[{logPc_lo},{logPc_hi}], Rp±{Rp_frac*100:.1f}%"
     )
+    print(f"  err_floor={err_floor:g}, burn_frac={burn_frac}, include_condensation={include_condensation}")
+    if log_scatt_fit:
+        print(f"  Scattering: log_scatt_factor=[{log_scatt_lo},{log_scatt_hi}] (init {log_scatt0_eff:.2f}), scatt_slope=[{scatt_slope_lo},{scatt_slope_hi}] (init {scatt_slope0:.2f})")
+    else:
+        print(f"  Scattering: log_scatt_factor fixed to 0 (Mie). scatt_slope=[{scatt_slope_lo},{scatt_slope_hi}] (init {scatt_slope0:.2f})")
+    print(f"  Error inflation: error_multiple=[{err_mult_lo},{err_mult_hi}] (init {err_mult0:.2f})")
 
-    bestfit_png = os.path.join(out_dir, f"07_platon_retrieval_bestfit_{tag}.png")
+    # ----------------------------
+    # F) Run emcee
+    # ----------------------------
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="divide by zero encountered in log10")
+        print(f"[Step7] Starting PLATON MCMC (~{nwalkers * nsteps} likelihood evals)")
+
+        if tqdm is not None:
+            with tqdm(total=nsteps, desc="PLATON emcee sampling", unit="step", leave=True) as pbar:
+                result = retriever.run_emcee(
+                    bins_m, depth, err,
+                    None, None, None,
+                    fit_info,
+                    nwalkers=nwalkers,
+                    nsteps=nsteps,
+                    include_condensation=include_condensation,
+                )
+                pbar.n = nsteps
+                pbar.refresh()
+        else:
+            result = retriever.run_emcee(
+                bins_m, depth, err,
+                None, None, None,
+                fit_info,
+                nwalkers=nwalkers,
+                nsteps=nsteps,
+                include_condensation=include_condensation,
+            )
+
+    # ----------------------------
+    # G) Save any figure PLATON left open
+    # ----------------------------
+    bestfit_png = os.path.join(out_dir, f"07_platon_equilibrium_bestfit_{tag}.png")
     if plt.gcf().axes:
         plt.tight_layout()
         plt.savefig(bestfit_png, dpi=200)
         print(f"Saved: {bestfit_png}")
     plt.close("all")
 
-    chain = np.asarray(result.flatchain)
-    lnprob = np.asarray(result.flatlnprobability)
+    # ----------------------------
+    # H) Extract posterior (step-wise burn if available)
+    # ----------------------------
+    if hasattr(result, "chain") and hasattr(result, "lnprobability"):
+        c = np.asarray(result.chain)
+        lp = np.asarray(result.lnprobability)
+        burn_steps = int(burn_frac * c.shape[1])
+        c = c[:, burn_steps:, :]
+        lp = lp[:, burn_steps:]
+        chain_post = c.reshape(-1, c.shape[-1])
+        lnprob_post = lp.reshape(-1)
+    else:
+        chain = np.asarray(result.flatchain)
+        lnprob = np.asarray(result.flatlnprobability)
+        good = np.isfinite(lnprob) & np.all(np.isfinite(chain), axis=1)
+        chain = chain[good]
+        lnprob = lnprob[good]
+        burn_n = int(burn_frac * chain.shape[0])
+        burn_n = min(burn_n, max(0, chain.shape[0] - 10))
+        chain_post = chain[burn_n:]
+        lnprob_post = lnprob[burn_n:]
 
-    corner_png = os.path.join(out_dir, f"07_corner_platon_retrieval_{tag}.png")
-    save_corner(corner_png, chain, fit_info.fit_param_names)
+    good = np.isfinite(lnprob_post) & np.all(np.isfinite(chain_post), axis=1)
+    chain_post = chain_post[good]
+    lnprob_post = lnprob_post[good]
+    if chain_post.shape[0] < 50:
+        raise RuntimeError("Too few finite samples; try increasing steps or tightening priors slightly.")
+    print(f"[Step7] Posterior samples kept: {chain_post.shape[0]}")
+
+    # ----------------------------
+    # I) Corner + save posterior
+    # ----------------------------
+    corner_png = os.path.join(out_dir, f"07_corner_platon_equilibrium_{tag}.png")
+    save_corner(corner_png, chain_post, fit_info.fit_param_names)
     print(f"Saved: {corner_png}")
 
-    i_best = int(np.nanargmax(lnprob))
-    p_best = chain[i_best]
-    ctx[f"platon_bestfit_{tag}"] = dict(zip(fit_info.fit_param_names, map(float, p_best)))
+    i_best = int(np.argmax(lnprob_post))
+    p_best = chain_post[i_best]
+    best = dict(zip(fit_info.fit_param_names, map(float, p_best)))
+    ctx[f"platon_bestfit_{tag}"] = best
+
+    npz_path = os.path.join(out_dir, f"07_platon_equilibrium_posterior_{tag}.npz")
+    np.savez(
+        npz_path,
+        fit_param_names=np.array(fit_info.fit_param_names, dtype=object),
+        chain=chain_post,
+        lnprob=lnprob_post,
+        meta=dict(
+            target="WASP-39b",
+            tag=tag,
+            err_floor=float(err_floor),
+            burn_frac=float(burn_frac),
+            nwalkers=int(nwalkers),
+            nsteps=int(nsteps),
+            profile_type=str(_get_fitinfo_key(fit_info, "profile_type")),
+            priors=dict(
+                T=[T_lo, T_hi],
+                logZ=[logZ_lo, logZ_hi],
+                CO_ratio=[CO_lo, CO_hi],
+                log_cloudtop_P=[logPc_lo, logPc_hi],
+                log_scatt_factor=([log_scatt_lo, log_scatt_hi] if log_scatt_fit else [0.0, 0.0]),
+                scatt_slope=[scatt_slope_lo, scatt_slope_hi],
+                error_multiple=[err_mult_lo, err_mult_hi],
+                Rp_frac=Rp_frac,
+            ),
+            input_bins=int(n_in),
+            base_valid=int(np.count_nonzero(base)),
+            phys_valid=int(np.count_nonzero(phys)),
+            higherr_dropped=int(dropped),
+            final_bins=int(len(depth)),
+        ),
+    )
+    print(f"Saved posterior: {npz_path}")
+
 
 def _load_transmission_spectrum_txt(path: str):
     # File format: header line, then 4 columns:
@@ -505,8 +815,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", default="all", help="e.g. all or 0,1,2,3,4,5,6,7")
     ap.add_argument("--skip-spectrum-mcmc", action="store_true")
-    ap.add_argument("--binning-factor", type=int, default=10)
-    ap.add_argument("--n-wavelength-bins", type=int, default=30)
+    ap.add_argument("--binning-factor", type=int, default=5)
+    ap.add_argument("--n-wavelength-bins", type=int, default=75)
     ap.add_argument("--spec-time-bin-factor", type=int, default=10)
     args = ap.parse_args()
 
@@ -514,18 +824,21 @@ def main() -> None:
 
     ctx: dict = {}
     ctx["white_light_mode"] = "binned"
+    ctx["platon_profile_type"] = "power_law"
     Step = {
         0: lambda: Step0(ctx),
         1: lambda: Step1(ctx),
         2: lambda: Step2(ctx, args.binning_factor),
         3: lambda: Step3(ctx),
         4: lambda: Step4(ctx),
-        5: lambda: (
-            #Step5(ctx, n_wl_bins=args.n_wavelength_bins, spec_time_bin=args.spec_time_bin_factor, white_tag="unbinned"),
-            Step5(ctx, n_wl_bins=args.n_wavelength_bins, spec_time_bin=args.spec_time_bin_factor, white_tag="binned"),
+        5: lambda: Step5(
+            ctx,
+            spec_time_bin=args.spec_time_bin_factor,
+            n_wl_bins=args.n_wavelength_bins,
+            white_tag="unbinned",
         ),
         6: lambda: Step6(ctx),
-        7: lambda: Step7(ctx),
+        7: lambda: Step7(ctx, tag="unbinned"),
     }
 
     for s in sorted(parse_steps(args.steps)):

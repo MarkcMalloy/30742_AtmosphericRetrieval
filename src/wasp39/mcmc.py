@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from .lightcurve import TransitConfig, batman_model
 
-N_CORES = 8
+N_CORES = 14
 
 
 @dataclass
@@ -113,7 +113,7 @@ class WhiteLightLogProb:
 
 def fit_white_light_mcmc(
     t, flux, flux_err, cfg_init, rp_init,
-    nwalkers=64, nsteps_burn=3000, nsteps_prod=8000, thin=1, progress=True,
+    nwalkers=64, nsteps_burn=500, nsteps_prod=1500, thin=5, progress=True,
     t0_width=0.1,
     per_bounds=(3.5, 4.5),
     a_bounds=(10.0, 13.0),

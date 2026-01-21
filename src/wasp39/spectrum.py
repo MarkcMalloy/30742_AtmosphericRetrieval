@@ -3,6 +3,12 @@ from __future__ import annotations
 import numpy as np
 from typing import Tuple, Optional
 
+# Optional progress bar (falls back gracefully if not installed)
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None
+
 from .binning import make_binned_lightcurve_for_wlbin, bin_time_series
 from .normalize import normalize_by_oot
 from .mcmc import fit_white_light_mcmc
@@ -27,6 +33,10 @@ def construct_transmission_spectrum(
     # Explicit finite wavelength span (Proj_WASP-style)
     wl_min: float = 0.5,
     wl_max: float = 5.0,
+    # Binning strategy
+    #  - 'equal_pixels': each wavelength bin contains ~equal number of wavelength columns
+    #  - 'uniform_wavelength': bins are uniform in wavelength span
+    binning_mode: str = "equal_pixels",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     STEP 5 — Transmission Spectrum Construction
@@ -81,13 +91,72 @@ def construct_transmission_spectrum(
             f"(data range: {data_min}–{data_max} µm)"
         )
 
-    # Explicit finite bin edges (Proj_WASP-style)
-    edges = np.linspace(wl_lo, wl_hi, n_wavelength_bins + 1)
+    # Restrict to requested wavelength range (keeps binning honest)
+    in_range = (wl >= wl_lo) & (wl <= wl_hi)
+    wl = wl[in_range]
+    f2 = f2[:, in_range]
+    e2 = e2[:, in_range]
 
     # We'll use these cleaned arrays from here on
     wavelength_um = wl
     flux_2d = f2
     fluxerr_2d = e2
+
+    # Build wavelength-bin definitions
+    # Each entry: (i0, i1, w0, w1, w_center)
+    bins: list[tuple[int, int, float, float, float]] = []
+
+    mode = str(binning_mode).strip().lower()
+    if mode not in {"equal_pixels", "uniform_wavelength"}:
+        raise ValueError(
+            f"Unknown binning_mode='{binning_mode}'. Expected 'equal_pixels' or 'uniform_wavelength'."
+        )
+
+    n_cols = int(wavelength_um.size)
+    if n_cols < max(1, min_wl_pixels):
+        raise ValueError(
+            f"Too few wavelength columns in range {wl_lo}–{wl_hi} µm: {n_cols}. "
+            f"Try widening wl_min/wl_max or lowering min_wl_pixels."
+        )
+
+    if mode == "uniform_wavelength":
+        # Uniform wavelength edges over [wl_lo, wl_hi]
+        edges = np.linspace(wl_lo, wl_hi, n_wavelength_bins + 1)
+        for k in range(n_wavelength_bins):
+            w0, w1 = float(edges[k]), float(edges[k + 1])
+            i0 = int(np.searchsorted(wavelength_um, w0, side="left"))
+            i1 = int(np.searchsorted(wavelength_um, w1, side="right"))
+            if i1 - i0 < min_wl_pixels:
+                continue
+            w_center = float(np.mean(wavelength_um[i0:i1]))
+            bins.append((i0, i1, w0, w1, w_center))
+    else:
+        # Equal-pixel binning: split wavelength columns into ~equal-sized groups.
+        # This avoids "holes" when some wavelength regions are sparsely sampled.
+        max_bins = max(1, n_cols // max(1, int(min_wl_pixels)))
+        nbins_eff = int(min(int(n_wavelength_bins), max_bins))
+        if nbins_eff < 1:
+            nbins_eff = 1
+
+        groups = np.array_split(np.arange(n_cols, dtype=int), nbins_eff)
+        for g in groups:
+            if g.size == 0:
+                continue
+            i0 = int(g[0])
+            i1 = int(g[-1]) + 1
+            if i1 - i0 < min_wl_pixels:
+                # Should be rare due to nbins_eff selection; skip if it happens
+                continue
+            w0 = float(wavelength_um[i0])
+            w1 = float(wavelength_um[i1 - 1])
+            w_center = float(np.mean(wavelength_um[i0:i1]))
+            bins.append((i0, i1, w0, w1, w_center))
+
+    if len(bins) < 3:
+        raise ValueError(
+            f"Too few usable wavelength bins after '{mode}' binning: {len(bins)}. "
+            f"Try lowering n_wavelength_bins or min_wl_pixels."
+        )
 
     wl_centers: list[float] = []
     depths: list[float] = []
@@ -106,56 +175,78 @@ def construct_transmission_spectrum(
     # ------------------------------------------------------
     # 5.2 — Loop wavelength bins, build LC, normalize, MCMC fit
     # ------------------------------------------------------
-    for k in range(n_wavelength_bins):
-        w0, w1 = float(edges[k]), float(edges[k + 1])
+    it = enumerate(bins, start=1)
+    if progress and (tqdm is not None):
+        # Materializing to a list keeps tqdm happy across environments.
+        it = tqdm(list(it), total=len(bins), desc="Spectrum bins", unit="bin")
 
-        # Skip bins that fall outside available wavelength range (should be rare due to clipping)
-        if w1 <= wavelength_um[0] or w0 >= wavelength_um[-1]:
-            if verbose:
-                print(f"    - Bin {k+1:02d}/{n_wavelength_bins}: {w0:.3f}–{w1:.3f} µm "
-                      f"SKIP (outside data range)")
-            continue
-
-        # Find indices in wavelength array for this bin
-        i0 = int(np.searchsorted(wavelength_um, w0, side="left"))
-        i1 = int(np.searchsorted(wavelength_um, w1, side="right"))
-        n_pix = i1 - i0
-
-        if n_pix < min_wl_pixels:
-            if verbose:
-                print(f"    - Bin {k+1:02d}/{n_wavelength_bins}: {w0:.3f}–{w1:.3f} µm "
-                      f"SKIP (only {n_pix} wavelength pixels)")
-            continue
+    for idx, (i0, i1, w0, w1, w_center) in it:
+        n_pix = int(i1 - i0)
+        if progress and (tqdm is not None) and hasattr(it, "set_postfix_str"):
+            it.set_postfix_str(f"{w0:.3f}-{w1:.3f} um")
 
         # Build a 1D light curve for this wavelength range
         f_bin, e_bin = make_binned_lightcurve_for_wlbin(flux_2d, fluxerr_2d, i0, i1)
 
         # Normalize by out-of-transit (OOT)
         f_norm, e_norm = normalize_by_oot(f_bin, e_bin, oot_index)
+        if (not np.all(np.isfinite(f_norm))) or (not np.all(np.isfinite(e_norm))):
+            if verbose:
+                print(f"      ! Bin {idx:02d}: non-finite after OOT normalize; skipping")
+            continue
 
         # Optional time binning (often helps speed/stability)
-        if time_bin_factor is not None and time_bin_factor > 1:
-            t_use, f_use, e_use = bin_time_series(bjd, f_norm, e_norm, time_bin_factor)
+        if time_bin_factor is not None and int(time_bin_factor) > 1:
+            t_use, f_use, e_use = bin_time_series(bjd, f_norm, e_norm, int(time_bin_factor))
         else:
             t_use, f_use, e_use = bjd, f_norm, e_norm
 
         if verbose:
-            print(f"    - Bin {k+1:02d}/{n_wavelength_bins}: {w0:.3f}–{w1:.3f} µm "
+            print(f"    - Bin {idx:02d}/{len(bins)}: {w0:.3f}–{w1:.3f} µm "
                   f"(pixels={n_pix}, points={len(t_use)})")
 
+        # Filter invalid points (prevents NaNs in log-likelihood)
+        good = np.isfinite(t_use) & np.isfinite(f_use) & np.isfinite(e_use) & (e_use > 0)
+        t_use, f_use, e_use = t_use[good], f_use[good], e_use[good]
+        if t_use.size < 20:
+            if verbose:
+                print(f"      ! Bin {idx:02d}: too few valid points after filtering; skipping")
+            continue
+
+        # Error floor to prevent inv_sigma2 blow-ups
+        e_use = np.maximum(e_use, 1e-8)
+
         # Run MCMC to fit Rp/R* for this bin
-        samples_rp, _ = fit_white_light_mcmc(
-            t_use, f_use, e_use, cfg,
-            rp_init=rp_init,
-            progress=progress,
-        )
+        try:
+            chain, labels, best_params, best_model = fit_white_light_mcmc(
+                t_use, f_use, e_use, cfg,
+                rp_init=rp_init,
+                progress=progress,
+            )
+        except ValueError as ex:
+            # emcee can throw if logprob returns NaN; skip this bin
+            if verbose:
+                print(f"      ! Bin {idx:02d}: MCMC failed ({ex}); skipping")
+            continue
+
+        try:
+            rp_idx = list(labels).index("rp")
+        except ValueError:
+            rp_idx = 4
+
+        samples_rp = np.asarray(chain[:, rp_idx], dtype=float)
+        samples_rp = samples_rp[np.isfinite(samples_rp)]
+        if samples_rp.size < 50:
+            if verbose:
+                print(f"      ! Bin {idx:02d}: too few finite rp samples ({samples_rp.size}); skipping")
+            continue
 
         # 5.3 — Build transmission depth posterior
         depth_samples = samples_rp ** 2
         depth_med = float(np.median(depth_samples))
         d16, d84 = np.percentile(depth_samples, [16, 84])
 
-        wl_centers.append(0.5 * (w0 + w1))
+        wl_centers.append(float(w_center))
         depths.append(depth_med)
         depth_err_lo.append(depth_med - float(d16))
         depth_err_hi.append(float(d84) - depth_med)
