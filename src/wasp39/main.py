@@ -400,27 +400,34 @@ def Step6(ctx: dict, *, white_tag: str = "binned") -> None:
     out_dir = ctx["out"]
 
     cfg = PlatonPlanetStar(
-        rp_over_rs=0.15,
+        rp_over_rs=0.10,
         rstar_rsun=0.895,
         mplanet_mjup=0.281,
-        temperature_k=1150.0,
+        temperature_k=1175.0,
         logZ=0.2,
-        CO_ratio=0.55,
-        cloudtop_pressure_pa=1e2,  # higher clouds (more flattening)
+        CO_ratio=0.3,
+        cloudtop_pressure_pa=1e6,  # higher clouds (more flattening)
     )
 
+    #abundance_overrides_vmr = {
+     #   "He": 0.09,
+      #  "H2O": 4e-3,
+       # "CO": 9e-5,
+        #"CO2": 2e-5,
+        #"CH4": 8e-6,
+        #"SO2": 1e-5,
+        #"K": 8e-4,
+    #}
     abundance_overrides_vmr = {
-        "He": 0.06,
-        "H2O": 6e-5,  # keep moderate
-        "CO2": 1e-7,  # down from 4e-7 to kill 4.3 µm
-        "CO": 3e-4,
-        "CH4": 1e-8,
+        "He": 0.09,
+        "H2O": 0.1,
+        "CO2": 0.1,
     }
     platon_list_opacity_names()
     binned_txt = f"{out_dir}/transmission_spectrum_binned.txt"
     platon_overlay_binned(
         binned_txt=binned_txt,
-        out_png=f"{out_dir}/06_platon_overlay_binned.png",
+        out_png=f"{out_dir}/final/06_platon_overlay_binned.png",
         cfg=cfg,
         abundance_overrides_vmr=abundance_overrides_vmr,
         zero_opacities=["CO,CO2"],

@@ -317,7 +317,7 @@ def platon_overlay_binned(
         plt.plot(wl_um_model, depth_model, lw=2, label="PLATON (raw @ bin centers)")
 
     if plot_matched_platon:
-        plt.plot(wl_um_model, depth_model_matched, lw=2, label="PLATON (baseline-matched)")
+        plt.plot(wl_um_model, depth_model_matched, lw=2, label="Platon Forward Model")
 
     plt.xlabel("Wavelength [µm]")
     plt.ylabel("Transit depth $(R_p/R_*)^2$")
